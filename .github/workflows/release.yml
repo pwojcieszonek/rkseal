@@ -9,6 +9,9 @@
 # with the `rubygems_mfa_required` flag set in the gemspec.
 #
 # To cut a release: bump VERSION in version.rb and merge to main. That's it.
+# If a release fails for an infra reason after the bump, re-run it from the
+# Actions tab (Run workflow) or `gh workflow run release.yml --ref main` — the
+# already-released guard makes the manual trigger idempotent.
 #
 # One-time setup on rubygems.org (Gem -> Trusted Publishers -> GitHub Actions):
 #   - Repository: pwojcieszonek/rkseal
@@ -22,6 +25,12 @@ on:
       - main
     paths:
       - lib/rkseal/version.rb
+  # Manual re-trigger for the current version when a push-triggered release
+  # failed for an infrastructure reason (e.g. a missing build dep) *after*
+  # version.rb was already bumped, so re-touching that file is not an option.
+  # The already-released guard below keeps this idempotent: it no-ops once the
+  # matching vX.Y.Z tag exists.
+  workflow_dispatch:
 
 jobs:
   release:
