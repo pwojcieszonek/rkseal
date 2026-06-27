@@ -83,8 +83,6 @@ module RKSeal
                                       desc: "sealed-secrets controller name"
     method_option :"controller-namespace", type: :string,
                                            desc: "controller namespace"
-    method_option :"refresh-cert", type: :boolean, default: false,
-                                   desc: "Bypass the cert cache and re-fetch from the controller"
     method_option :"from-file", type: :array,
                                 desc: "Pre-seed key=path value(s) into the buffer before editing"
     method_option :"no-edit", type: :boolean, default: false,
@@ -163,8 +161,6 @@ module RKSeal
                                       desc: "sealed-secrets controller name"
     method_option :"controller-namespace", type: :string,
                                            desc: "controller namespace"
-    method_option :"refresh-cert", type: :boolean, default: false,
-                                   desc: "Bypass the cert cache and re-fetch from the controller"
     # Edit an existing SealedSecret. Reads current values from the cluster; if
     # the Secret is absent there but a local <NAME>.yaml exists, automatically
     # falls back to the offline local edit. `--local` forces the offline path.
@@ -201,8 +197,6 @@ module RKSeal
                                       desc: "sealed-secrets controller name"
     method_option :"controller-namespace", type: :string,
                                            desc: "controller namespace"
-    method_option :"refresh-cert", type: :boolean, default: false,
-                                   desc: "Bypass the cert cache and re-fetch from the controller"
     # Re-encrypt an existing SealedSecret to the newest controller key.
     #
     # @param namespace [String] target namespace.
@@ -238,8 +232,6 @@ module RKSeal
                                       desc: "sealed-secrets controller name"
     method_option :"controller-namespace", type: :string,
                                            desc: "controller namespace"
-    method_option :"refresh-cert", type: :boolean, default: false,
-                                   desc: "Bypass the cert cache and re-fetch from the controller"
     # Validate a SealedSecret (local <NAME>.yaml, or --file <path>).
     #
     # @param namespace [String, nil] target namespace (omit with --file).
@@ -428,22 +420,20 @@ module RKSeal
     end
 
     # Build the kubeseal adapter from the cert/controller options. Dashed option
-    # names are string keys (Thor does not auto-underscore them). `--refresh-cert`
-    # bypasses the cert cache (`Kubeseal.new(refresh_cert:)`); it defaults to
-    # false for every command that builds a kubeseal adapter.
+    # names are string keys (Thor does not auto-underscore them).
     #
-    # The controller name/namespace are Kubernetes identifiers that flow into the
-    # on-disk cert-cache path, so they are validated as DNS-1123 here (same gate
-    # as the positional args) -- this prevents `../`, `/`, a leading `-`, or NUL
-    # from escaping the cache directory before any path is built.
+    # The controller name/namespace are Kubernetes identifiers that flow straight
+    # into kubeseal's `--controller-name`/`--controller-namespace` flags, so they
+    # are validated as DNS-1123 here (same gate as the positional args) -- this
+    # rejects flag-injection (`-oyaml`, a leading `-`) and NUL before any value
+    # reaches the shell-out.
     def build_kubeseal
       controller_name = validated_controller("controller-name")
       controller_namespace = validated_controller("controller-namespace")
       Kubeseal.new(
         cert: options["cert"],
         controller_name: controller_name,
-        controller_namespace: controller_namespace,
-        refresh_cert: options.fetch("refresh-cert", false)
+        controller_namespace: controller_namespace
       )
     end
 

@@ -146,14 +146,6 @@ RSpec.describe RKSeal::CLI do
         expect(out).to match(/Deployed/i)
       end
 
-      it "wires --refresh-cert through to Kubeseal.new(refresh_cert: true)" do
-        allow(RKSeal::Commands::Edit).to receive(:new).and_return(edit_command)
-        allow(RKSeal::Kubeseal).to receive(:new).and_call_original
-        run_dispatch(%w[edit app db --refresh-cert])
-        expect(RKSeal::Kubeseal).to have_received(:new)
-          .with(hash_including(refresh_cert: true))
-      end
-
       context "with --local" do
         let(:local_command) { instance_double(RKSeal::Commands::EditLocal, call: result) }
 
@@ -423,10 +415,11 @@ RSpec.describe RKSeal::CLI do
       end
     end
 
-    describe "controller-flag validation (cert-cache path safety)" do
-      # --controller-name/--controller-namespace flow into the on-disk cert-cache
-      # path, so a traversal value must be rejected at the boundary, before any
-      # Kubeseal adapter (and thus any cache path) is built.
+    describe "controller-flag validation (flag-injection safety)" do
+      # --controller-name/--controller-namespace flow straight into kubeseal's
+      # --controller-name/--controller-namespace flags, so a traversal or
+      # leading-dash value must be rejected at the boundary, before any Kubeseal
+      # adapter is built.
       it "rejects a traversal --controller-namespace before building the adapter" do
         expect(RKSeal::Kubeseal).not_to receive(:new)
         expect(RKSeal::Commands::Create).not_to receive(:new)

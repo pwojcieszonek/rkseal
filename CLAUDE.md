@@ -77,14 +77,16 @@ spec:
 
 `kubeseal` needs the controller's cert to encrypt. Sources, in order of usefulness here:
 `--cert <file|URL>` or the `SEALED_SECRETS_CERT` env var (offline — nothing contacted), else
-`--fetch-cert` from the live controller. A fetched cert (it is **public**) is **fetched-and-
-cached** on disk so repeated seals do not each hit the cluster:
-`${XDG_CACHE_HOME:-$HOME/.cache}/rkseal/<controller-namespace>/<controller-name>.pem`
-(dir `0755`, file `0644`; one entry per controller identity, the namespace a path segment so
-distinct identities can never collide; writes go through a temp file + atomic rename so a
-concurrent seal never reads a half-written cert). `--refresh-cert` bypasses the cache and
-refetches. The cache is implemented as a `CertCache` defined **inline** inside
-`RKSeal::Kubeseal` (so the adapter stays self-contained, no extra top-level require).
+`--fetch-cert` from the live controller. **The cert is never cached on disk.** When neither
+offline source is configured, the cert is fetched fresh from the controller on every
+invocation, so a seal is always bound to the *current context's* controller key. This is a
+deliberate choice: a cross-invocation disk cache keyed only by `<controller-namespace>/
+<controller-name>` (which is identical across clusters — `kube-system/sealed-secrets-controller`
+is the default everywhere) silently served one cluster's public cert when sealing for another,
+producing ciphertext the target controller could not decrypt (`no key could decrypt secret`).
+It also went stale on controller rekey/reinstall. Fetching fresh costs one sub-second
+`--fetch-cert` per invocation and removes both failure modes; GitOps/CI that wants offline,
+reproducible seals pins `--cert`/`SEALED_SECRETS_CERT` instead (strictly better than a cache).
 
 ### Key rotation
 
@@ -101,8 +103,9 @@ over external binaries) — each independently testable and mockable:
 - `RKSeal::Commands::{Create,Edit,EditLocal,Reencrypt,Validate,View,List}` — orchestrate one
   flow each (`EditLocal` is the offline `edit --local`; see below).
 - `RKSeal::Kubeseal` — adapter over the `kubeseal` binary (`ensure_cert!`, `seal`,
-  `fetch_cert`, `re_encrypt`, `validate`). Owns scope/cert/controller flags and the inline
-  `CertCache` (fetch-and-cache of the public cert; `refresh_cert:` ↔ `--refresh-cert`).
+  `fetch_cert`, `re_encrypt`, `validate`). Owns scope/cert/controller flags. `ensure_cert!` is
+  a fail-fast reachability probe (`--fetch-cert`, result discarded); the cert is never cached —
+  `seal` re-fetches fresh each time (or passes an explicit `--cert`).
 - `RKSeal::Kubectl` — adapter over `kubectl` (`get_secret`, `apply`, `current_context`).
 - `RKSeal::Editor` — launches `$EDITOR` on a buffer and returns the edited content.
 - `RKSeal::SecureWorkspace` — provides the **in-memory** scratch file (see constraints) and
@@ -190,8 +193,8 @@ for both.
    `--scope` is **rejected** (kept ciphertext cannot be re-sealed under a new scope without its
    plaintext); `name`/`namespace` are fixed (strict ciphertext binds them, and they are shared
    with the kept entries).
-5. The cluster is touched **only** when a reseal is actually needed — and then only for the
-   controller's **public** cert (offline if already cached). The file is always re-emitted as
+5. The cluster is touched **only** when a reseal is actually needed — and then only to fetch the
+   controller's **public** cert (unless `--cert`/env supplies it offline). The file is re-emitted as
    YAML: `kubeseal --merge-into` (v0.36.6) rewrites it as JSON regardless of input format, so
    `EditLocal` normalizes it back so a `.yaml` always holds YAML.
 6. `--deploy`/`--yes` behave exactly like `edit` (opt-in, `ContextGuard`-gated).
@@ -324,8 +327,8 @@ Settled:
   (verbatim, not decoded) by default; plaintext goes under `stringData`, and `--string-data`
   decodes the whole buffer to plaintext `stringData`.
 - **Commands (shipped):** `create`, `edit` (incl. offline `--local`, see below), `reencrypt`
-  (rotate onto the current key; `--deploy`/`--yes`/`--refresh-cert`), `validate` (controller
-  pre-flight, read-only; `--file <path>`/`--refresh-cert`), `view` (print live Secret,
+  (rotate onto the current key; `--deploy`/`--yes`), `validate` (controller
+  pre-flight, read-only; `--file <path>`), `view` (print live Secret,
   read-only; `--reveal` decodes to plaintext `stringData`), `list` (read-only, metadata-only
   table of `NAMESPACE`/`NAME`/`SCOPE`/`AGE` across all namespaces or one `[namespace]`).
 - **Offline local edit (never-deployed SealedSecret):** reached **automatically** when `edit`
@@ -337,12 +340,14 @@ Settled:
   emits JSON). The auto-fallback fires only on a definitive `NotFound`. See the offline local
   edit flow above and `RKSeal::Commands::EditLocal` / `RKSeal::SealedSecret`.
 - **`create` cert handling:** the controller cert is pre-resolved up front (`--cert`/env, else
-  the cached/fetched cert) and fails fast before the editor opens.
-- **Cert fetch-and-cache:** a fetched (public) cert is cached at
-  `${XDG_CACHE_HOME:-$HOME/.cache}/rkseal/<controller-namespace>/<controller-name>.pem` (the
-  namespace a path segment so distinct identities never collide; temp-file + atomic-rename
-  write) so repeated seals stay offline; `--refresh-cert` (↔ `Kubeseal.new(refresh_cert:)`)
-  bypasses it. `CertCache` is inline in `RKSeal::Kubeseal`.
+  a `--fetch-cert` probe) and fails fast before the editor opens.
+- **No cert cache:** the public cert is never persisted on disk. With no offline source
+  (`--cert`/`SEALED_SECRETS_CERT`) it is fetched fresh from the controller on every invocation,
+  so every seal is bound to the *current context's* key. A disk cache keyed only by
+  `<controller-namespace>/<controller-name>` collided across clusters (that path is identical
+  everywhere) and went stale on rekey — it once produced ciphertext the target controller could
+  not decrypt. Offline/reproducible CI pins `--cert`/env instead. (Removed in
+  `refactor/drop-cert-cache`; previously a `--refresh-cert` flag bypassed the cache.)
 - **Output filename:** `<secret-name>.yaml`, written to the current working directory.
 - **Name/namespace validation:** both positional args must be DNS-1123 labels; path-traversal
   / flag-injection inputs are rejected with `InvalidInputError` before any side effect.

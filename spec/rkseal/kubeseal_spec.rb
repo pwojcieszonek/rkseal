@@ -1,32 +1,19 @@
 # frozen_string_literal: true
 
-require "tmpdir"
-require "fileutils"
-
 RSpec.describe RKSeal::Kubeseal do
   subject(:kubeseal) { described_class.new(binary: "kubeseal") }
 
-  # Isolate cert resolution from the real machine: every example gets a fresh,
-  # empty XDG cache dir and a cleared SEALED_SECRETS_CERT, restored afterwards.
-  # This keeps cache reads/writes inside a temp dir and stops a stray real cert
-  # (env or ~/.cache) from changing what #seal/#ensure_cert! do.
+  # Isolate cert resolution from the real machine: clear SEALED_SECRETS_CERT for
+  # every example (restored afterwards) so a stray real env cert cannot change
+  # what #seal/#ensure_cert! do.
   around do |example|
-    Dir.mktmpdir("rkseal-cache-spec") do |dir|
-      saved_xdg = ENV.fetch("XDG_CACHE_HOME", nil)
-      saved_cert = ENV.fetch("SEALED_SECRETS_CERT", nil)
-      ENV["XDG_CACHE_HOME"] = dir
-      ENV.delete("SEALED_SECRETS_CERT")
-      begin
-        example.run
-      ensure
-        restore_env("XDG_CACHE_HOME", saved_xdg)
-        restore_env("SEALED_SECRETS_CERT", saved_cert)
-      end
+    saved_cert = ENV.fetch("SEALED_SECRETS_CERT", nil)
+    ENV.delete("SEALED_SECRETS_CERT")
+    begin
+      example.run
+    ensure
+      saved_cert.nil? ? ENV.delete("SEALED_SECRETS_CERT") : ENV["SEALED_SECRETS_CERT"] = saved_cert
     end
-  end
-
-  def restore_env(key, value)
-    value.nil? ? ENV.delete(key) : ENV[key] = value
   end
 
   # The adapter's single shell-out seam. Stubbing it keeps every example below
@@ -84,34 +71,20 @@ RSpec.describe RKSeal::Kubeseal do
       expect(kubeseal).to have_received(:fetch_cert)
     end
 
-    it "fetches and caches when no offline cert and no cache exists yet" do
+    it "probes the controller with --fetch-cert (discarding the PEM) when no offline cert is set" do
       allow(kubeseal).to receive(:fetch_cert).and_return("-----BEGIN CERTIFICATE-----\nPEM\n")
 
       expect(kubeseal.ensure_cert!).to be_nil
       expect(kubeseal).to have_received(:fetch_cert).once
-      expect(File.read(kubeseal.send(:cert_cache).path)).to include("PEM")
     end
 
-    it "reuses the cached cert without fetching again on the next call" do
+    it "re-probes on every call -- nothing is cached between invocations" do
       allow(kubeseal).to receive(:fetch_cert).and_return("-----BEGIN CERTIFICATE-----\n")
 
-      kubeseal.ensure_cert! # populates the cache
-      kubeseal.ensure_cert! # should hit the cache
+      kubeseal.ensure_cert!
+      kubeseal.ensure_cert!
 
-      expect(kubeseal).to have_received(:fetch_cert).once
-    end
-
-    it "refetches and overwrites the cache when refresh_cert: true" do
-      cache_path = described_class.new.send(:cert_cache).path
-      FileUtils.mkdir_p(File.dirname(cache_path))
-      File.write(cache_path, "STALE")
-      refresher = described_class.new(binary: "kubeseal", refresh_cert: true)
-      allow(refresher).to receive(:fetch_cert).and_return("FRESH-PEM")
-
-      refresher.ensure_cert!
-
-      expect(refresher).to have_received(:fetch_cert)
-      expect(File.read(cache_path)).to eq("FRESH-PEM")
+      expect(kubeseal).to have_received(:fetch_cert).twice
     end
 
     it "propagates CommandError when no offline cert is set and the controller is unreachable" do
@@ -131,7 +104,6 @@ RSpec.describe RKSeal::Kubeseal do
 
   describe "#seal" do
     it "pipes the manifest to kubeseal on stdin with -o yaml and the resolved --scope" do
-      allow(kubeseal).to receive(:fetch_cert).and_return("PEM")
       captured = stub_run
 
       kubeseal.seal("kind: Secret\n", scope: :namespace_wide)
@@ -143,7 +115,6 @@ RSpec.describe RKSeal::Kubeseal do
     end
 
     it "defaults to the strict scope" do
-      allow(kubeseal).to receive(:fetch_cert).and_return("PEM")
       captured = stub_run
 
       kubeseal.seal("kind: Secret\n")
@@ -152,7 +123,6 @@ RSpec.describe RKSeal::Kubeseal do
     end
 
     it "maps cluster_wide to the cluster-wide kubeseal flag" do
-      allow(kubeseal).to receive(:fetch_cert).and_return("PEM")
       captured = stub_run
 
       kubeseal.seal("kind: Secret\n", scope: :cluster_wide)
@@ -175,25 +145,21 @@ RSpec.describe RKSeal::Kubeseal do
       expect(adapter).not_to have_received(:fetch_cert)
     end
 
-    it "passes the cached cert path via --cert when no explicit/env cert is set" do
-      allow(kubeseal).to receive(:fetch_cert).and_return("PEM")
-      captured = stub_run
-
-      kubeseal.seal("kind: Secret\n")
-
-      cache_path = kubeseal.send(:cert_cache).path
-      expect(captured[:argv].each_cons(2)).to include(["--cert", cache_path])
-    end
-
-    it "omits --cert (lets kubeseal read the env var) when SEALED_SECRETS_CERT is set" do
-      ENV["SEALED_SECRETS_CERT"] = "/certs/from-env.pem"
-      allow(kubeseal).to receive(:fetch_cert)
+    it "omits --cert (kubeseal fetches fresh from the controller) with no explicit/env cert" do
       captured = stub_run
 
       kubeseal.seal("kind: Secret\n")
 
       expect(captured[:argv]).not_to include("--cert")
-      expect(kubeseal).not_to have_received(:fetch_cert)
+    end
+
+    it "omits --cert (lets kubeseal read the env var) when SEALED_SECRETS_CERT is set" do
+      ENV["SEALED_SECRETS_CERT"] = "/certs/from-env.pem"
+      captured = stub_run
+
+      kubeseal.seal("kind: Secret\n")
+
+      expect(captured[:argv]).not_to include("--cert")
     end
 
     it "passes controller name/namespace flags when configured" do
@@ -406,61 +372,6 @@ RSpec.describe RKSeal::Kubeseal do
       expect(captured[:argv].each_cons(2)).to include(%w[-o yaml])
       expect(captured[:stdin]).to eq("kind: SealedSecret\n")
       expect(result).to eq("kind: SealedSecret\n")
-    end
-  end
-
-  describe RKSeal::Kubeseal::CertCache do
-    subject(:cache) do
-      described_class.new(
-        controller_namespace: "kube-system",
-        controller_name: "sealed-secrets-controller"
-      )
-    end
-
-    let(:entry) { File.join("kube-system", "sealed-secrets-controller.pem") }
-
-    it "names the entry <namespace>/<name>.pem under $XDG_CACHE_HOME/rkseal" do
-      expect(cache.path)
-        .to eq(File.join(ENV.fetch("XDG_CACHE_HOME"), "rkseal", entry))
-    end
-
-    it "falls back to ~/.cache/rkseal when XDG_CACHE_HOME is unset" do
-      ENV.delete("XDG_CACHE_HOME")
-
-      expect(cache.path).to eq(File.join(Dir.home, ".cache", "rkseal", entry))
-    end
-
-    it "gives two identities that share a <namespace>-<name> string distinct paths" do
-      first = described_class.new(controller_namespace: "a-b", controller_name: "c")
-      second = described_class.new(controller_namespace: "a", controller_name: "b-c")
-
-      expect(first.path).not_to eq(second.path)
-    end
-
-    it "writes atomically, leaving no temp files behind" do
-      cache.write("-----BEGIN CERTIFICATE-----\nABC\n")
-
-      leftovers = Dir.children(File.dirname(cache.path)).grep(/\.tmp\z/)
-      expect(leftovers).to be_empty
-    end
-
-    it "reports existence and round-trips the PEM through read" do
-      expect(cache.exist?).to be(false)
-
-      cache.write("-----BEGIN CERTIFICATE-----\nABC\n")
-
-      expect(cache.exist?).to be(true)
-      expect(cache.read).to eq("-----BEGIN CERTIFICATE-----\nABC\n")
-    end
-
-    it "writes the cert world-readable (0644) -- it is public, not secret" do
-      cache.write("PEM")
-
-      expect(File.stat(cache.path).mode & 0o777).to eq(0o644)
-    end
-
-    it "returns the path from #write so callers can pass it to --cert" do
-      expect(cache.write("PEM")).to eq(cache.path)
     end
   end
 

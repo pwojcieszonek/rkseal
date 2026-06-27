@@ -63,7 +63,7 @@ example to make this obvious. Pass `--string-data` to decode the **whole** buffe
 - `--local` — force the offline local edit without contacting the cluster at all (see below).
 - `--string-data` — decode the live Secret's `data` into plaintext `stringData` for editing,
   instead of showing it as raw base64.
-- `--cert`, `--controller-name`, `--controller-namespace`, `--refresh-cert` — control which
+- `--cert`, `--controller-name`, `--controller-namespace` — control which
   controller certificate is used to re-seal (same as `create`).
 - **No-op short-circuit:** if you save the buffer without changing anything, `rkseal` writes
   no file (re-sealing identical input would only produce a spurious ciphertext diff). Because
@@ -98,7 +98,6 @@ online `edit`.
   TLS / dockerconfig / binary payloads).
 - `--string-data` — seed the buffer with a plaintext `stringData` block instead of base64
   `data`, so you type values in clear (folded into `data` on save).
-- `--refresh-cert` — bypass the cached controller cert and re-fetch it for this run.
 - The controller certificate is resolved up front, so an unreachable controller fails fast
   **before** you start editing.
 
@@ -106,23 +105,27 @@ online `edit`.
 
 - `--deploy` / `--yes` — same deploy semantics as `edit` (opt-in, context-confirmed; `--yes`
   skips the prompt).
-- `--cert`, `--controller-name`, `--controller-namespace`, `--refresh-cert`.
+- `--cert`, `--controller-name`, `--controller-namespace`.
 
 ### `validate` flags
 
 - `--file <path>` — validate an arbitrary SealedSecret manifest instead of the local
   `<secret-name>.yaml` (then `NAMESPACE`/`NAME` are optional).
-- `--cert`, `--controller-name`, `--controller-namespace`, `--refresh-cert`.
+- `--cert`, `--controller-name`, `--controller-namespace`.
 
 ### `view` flags
 
 - `--reveal` — decode `data` and print values as plaintext `stringData` (default shows raw
   base64, consistent with `edit`). Read-only: `view` never writes a file or opens an editor.
 
-### `--refresh-cert`
+### Controller certificate
 
-`create`, `edit`, `reencrypt`, and `validate` accept `--refresh-cert` to bypass the cached
-controller certificate and re-fetch it from the live controller for that run.
+`create`, `edit`, `reencrypt`, and `validate` resolve the controller's public cert from, in
+order: `--cert <file|URL>`, the `SEALED_SECRETS_CERT` env var (both offline — nothing is
+contacted), otherwise a fresh `--fetch-cert` from the live controller. **The cert is never
+cached on disk** — it is re-fetched every run, so a seal is always bound to the current kube
+context's controller key. For offline or reproducible (GitOps/CI) seals, pin `--cert` or
+`SEALED_SECRETS_CERT` to a committed certificate.
 
 ## Requirements
 
