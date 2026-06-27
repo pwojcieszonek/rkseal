@@ -1,0 +1,77 @@
+# Publishes the gem to rubygems.org when the version is bumped.
+#
+# Trigger: any push to `main` that touches lib/rkseal/version.rb.
+# The version file is the single source of truth — there is no separate tagging
+# step and therefore no tag/version drift. `rubygems/release-gem` runs
+# `rake release`, which builds the gem, creates and pushes the matching
+# `vX.Y.Z` tag, attaches sigstore attestations and pushes to rubygems.org via
+# Trusted Publishing (OIDC) — no API key is stored anywhere. This is compatible
+# with the `rubygems_mfa_required` flag set in the gemspec.
+#
+# To cut a release: bump VERSION in version.rb and merge to main. That's it.
+#
+# One-time setup on rubygems.org (Gem -> Trusted Publishers -> GitHub Actions):
+#   - Repository: pwojcieszonek/rkseal
+#   - Workflow filename: release.yml
+#   - Environment: release
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - lib/rkseal/version.rb
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    # Must match the Trusted Publisher configured on rubygems.org. Add required
+    # reviewers to this environment in repo settings for a manual approval gate.
+    environment: release
+
+    permissions:
+      contents: write # rake release pushes the version tag
+      id-token: write # OIDC token for Trusted Publishing + attestations
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ruby # read from .ruby-version
+          bundler-cache: true
+
+      - name: Read gem version
+        id: version
+        run: |
+          version="$(ruby -Ilib -r rkseal/version -e 'print RKSeal::VERSION')"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      # Guard: skip cleanly if this version was already released (e.g. version.rb
+      # was edited without bumping, or the workflow is re-run). Without this the
+      # rubygem push would fail loudly on a duplicate version.
+      - name: Check whether this version is already released
+        id: guard
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Already released: ${{ steps.version.outputs.tag }} — skipping."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build, tag and push the gem
+        if: steps.guard.outputs.release == 'true'
+        uses: rubygems/release-gem@v1
+
+      # release-gem creates the git tag but not a GitHub Release object. Generate
+      # one from the tag for a nice changelog on the Releases page.
+      - name: Create GitHub Release
+        if: steps.guard.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes --verify-tag
