@@ -48,6 +48,7 @@ Gem::Specification.new do |spec|
 
   # Development dependencies. Versions are intentionally left as compatible ranges
   # rather than hard pins until the toolchain is proven on Ruby 4.0.2.
+  spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rspec", "~> 3.13"
   spec.add_development_dependency "rubocop", "~> 1.60"
 end
