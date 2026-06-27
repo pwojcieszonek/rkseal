@@ -1,0 +1,30 @@
+# Bundler / RubyGems
+/.bundle/
+/vendor/bundle/
+/pkg/
+/tmp/
+*.gem
+Gemfile.lock
+
+# RSpec
+/spec/examples.txt
+/.rspec_status
+
+# RuboCop
+/.rubocop-https---*
+
+# Coverage
+/coverage/
+
+# Editors / OS
+*.swp
+*.swo
+.DS_Store
+/.idea/
+/.vscode/
+/.ruby-lsp/
+
+# Sealed secret output written by the CLI into a working dir
+# (never commit generated manifests from this repo's own runs)
+/*.yaml
+!/.github/**/*.yaml

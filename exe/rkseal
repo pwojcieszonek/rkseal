@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "rkseal"
+
+# Thin entry point: hand the raw ARGV to the Thor CLI and translate the gem's
+# fail-fast errors into a clean non-zero exit with a single-line message, rather
+# than dumping a Ruby backtrace on the user. Implementation lives in RKSeal::CLI.
+RKSeal::CLI.dispatch(ARGV)

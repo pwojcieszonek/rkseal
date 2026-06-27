@@ -1,0 +1,48 @@
+AllCops:
+  TargetRubyVersion: 4.0
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "vendor/**/*"
+    - "tmp/**/*"
+    - "pkg/**/*"
+
+# House style: double-quoted string literals everywhere (consistent, and avoids
+# churn when interpolation is later added to a literal).
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
+
+# Contract skeletons carry long, deliberate docstrings; don't punish them.
+Layout/LineLength:
+  Max: 100
+  AllowedPatterns:
+    - "^\\s*#"
+
+# Specs read better with long describe/context blocks and example bodies.
+Metrics/BlockLength:
+  Exclude:
+    - "spec/**/*"
+    - "rkseal.gemspec"
+
+# Stub method bodies that only `raise NotImplementedError` should not trip
+# method-length or documentation cops while the contracts are unimplemented.
+Style/Documentation:
+  Enabled: false
+
+Metrics/MethodLength:
+  Max: 15
+
+# Keyword-argument-heavy adapter signatures are intentional and self-documenting.
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+
+# Allow the conventional `RKSeal` acronym casing.
+Naming/ClassAndModuleCamelCase:
+  Enabled: true
+
+# Gemspec development-dependency warnings are not relevant to this internal CLI.
+Gemspec/DevelopmentDependencies:
+  Enabled: false
