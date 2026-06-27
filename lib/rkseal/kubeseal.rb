@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 
 require "open3"
-require "fileutils"
-require "securerandom"
 
 module RKSeal
   # Thin adapter over the `kubeseal` binary.
@@ -19,9 +17,11 @@ module RKSeal
   # stub a single seam (or stub the public methods directly). The runner must
   # never echo stdin (the plaintext Secret) into logs or error messages.
   #
-  # rubocop:disable Metrics/ClassLength -- the inline {CertCache} is co-located
-  # here by design (the cert cache is intrinsic to this adapter and must not add
-  # a new top-level require); that nested class accounts for the extra lines.
+  # The controller certificate is never cached on disk: an explicit `--cert` or
+  # `SEALED_SECRETS_CERT` is used offline, otherwise it is fetched fresh from the
+  # live controller on every invocation. This keeps a seal always bound to the
+  # current context's controller key -- no stale or cross-cluster cert can sneak
+  # in (see {#ensure_cert!}).
   class Kubeseal
     BINARY = "kubeseal"
 
@@ -32,13 +32,6 @@ module RKSeal
       cluster_wide: "cluster-wide"
     }.freeze
 
-    # kubeseal's own defaults for the controller's identity. Used to name the
-    # cache entry consistently when the caller does not override them, so a run
-    # with implicit defaults and a run with explicit-but-identical flags share
-    # one cached cert.
-    DEFAULT_CONTROLLER_NAME = "sealed-secrets-controller"
-    DEFAULT_CONTROLLER_NAMESPACE = "kube-system"
-
     # Substring kubeseal prints to stderr when the controller could decrypt-test
     # the SealedSecret but it is NOT valid. Anything else on a non-zero
     # `--validate` exit is treated as operational (CommandError), not a verdict.
@@ -48,16 +41,13 @@ module RKSeal
     # @param controller_name [String, nil] `--controller-name` value.
     # @param controller_namespace [String, nil] `--controller-namespace` value.
     # @param cert [String, nil] `--cert <file|URL>` source; when nil and no env
-    #   cert is present, the cert is fetched from the controller and cached.
-    # @param refresh_cert [Boolean] when true, ignore any cached cert and
-    #   overwrite it with a freshly fetched one (wired to `--refresh-cert`).
+    #   cert is present, the cert is fetched fresh from the controller per seal.
     def initialize(binary: BINARY, controller_name: nil, controller_namespace: nil,
-                   cert: nil, refresh_cert: false)
+                   cert: nil)
       @binary = binary
       @controller_name = controller_name
       @controller_namespace = controller_namespace
       @cert = cert
-      @refresh_cert = refresh_cert
     end
 
     # Verify the kubeseal binary is present and executable; raise otherwise.
@@ -73,13 +63,12 @@ module RKSeal
             "Install it from https://github.com/bitnami-labs/sealed-secrets/releases."
     end
 
-    # Resolve the encryption certificate up front so a flow fails fast before any
-    # editor opens. When an offline cert is configured (`--cert` or the
-    # `SEALED_SECRETS_CERT` env var) nothing is contacted. Otherwise the cert is
-    # resolved through the on-disk cache: a cached PEM is reused as-is, otherwise
-    # it is fetched from the live controller and written to the cache (which is
-    # what makes a subsequent {#seal} offline). `refresh_cert: true` skips the
-    # cached copy and refetches.
+    # Confirm the encryption certificate is obtainable up front so a flow fails
+    # fast before any editor opens. When an offline cert is configured (`--cert`
+    # or the `SEALED_SECRETS_CERT` env var) nothing is contacted. Otherwise the
+    # controller is probed with `--fetch-cert`; the fetched PEM is intentionally
+    # discarded -- {#seal} re-fetches at seal time, so the freshest controller
+    # key is always used and nothing is persisted between invocations.
     #
     # @return [void]
     # @raise [RKSeal::CommandError] if no offline cert is configured and the
@@ -87,17 +76,17 @@ module RKSeal
     def ensure_cert!
       return if offline_cert?
 
-      resolve_cached_cert_path
+      fetch_cert
       nil
     end
 
     # Seal a Secret manifest into a SealedSecret.
     #
     # Pipes `manifest_yaml` to kubeseal on stdin with `-o yaml` and the resolved
-    # `--scope`. The certificate is resolved offline-first: an explicit `--cert`
-    # or the cached controller PEM is passed via `--cert` (no API round-trip);
-    # only when neither is available does kubeseal fall back to the env var or
-    # the controller itself. Returns the SealedSecret YAML on stdout.
+    # `--scope`. An explicit `--cert` is passed straight through; otherwise no
+    # `--cert` is given and kubeseal resolves the cert itself -- from
+    # `SEALED_SECRETS_CERT`, or failing that fresh from the live controller.
+    # Returns the SealedSecret YAML on stdout.
     #
     # @param manifest_yaml [String] a full Secret manifest (from
     #   {RKSeal::Secret#to_manifest}).
@@ -158,11 +147,10 @@ module RKSeal
     # entry untouched. This is what powers the offline `edit --local` flow,
     # where kept keys must stay byte-for-byte unchanged.
     #
-    # The certificate is resolved offline-first, exactly like {#seal}: an
-    # explicit `--cert` or the cached controller PEM is passed via `--cert` (no
-    # API round-trip); only when neither is available does kubeseal fall back to
-    # the env var or the controller. The output format is inherited from the
-    # existing file, so `-o` is NOT forced here.
+    # The certificate is resolved exactly like {#seal}: an explicit `--cert` is
+    # passed through, otherwise kubeseal resolves it itself (env var, else fresh
+    # from the controller). The output format is inherited from the existing
+    # file, so `-o` is NOT forced here.
     #
     # @param manifest_yaml [String] Secret manifest with the items to add.
     # @param file [String] path to the existing SealedSecret to merge into.
@@ -218,30 +206,12 @@ module RKSeal
       ENV.fetch("SEALED_SECRETS_CERT", "")
     end
 
-    # Resolve a cert file/URL to pass to `--cert`, or nil to let kubeseal fall
-    # back to its own sources. Precedence: explicit `--cert` > env var (kubeseal
-    # reads SEALED_SECRETS_CERT itself, so we pass nil) > cached/fetched PEM.
+    # The cert file/URL to pass to `--cert`, or nil to let kubeseal resolve it
+    # itself. Only an explicit `--cert` is forwarded; with none configured we
+    # pass nil so kubeseal reads SEALED_SECRETS_CERT or fetches fresh from the
+    # controller (the env var is never passed as a path -- kubeseal reads it).
     def resolved_cert_path
-      return @cert if @cert
-      return nil unless env_cert.strip.empty?
-
-      resolve_cached_cert_path
-    end
-
-    # Return the path to a usable cached controller PEM, fetching and writing it
-    # first if absent (or if a refresh was requested). The cert is public, so the
-    # cache file is world-readable.
-    def cert_cache
-      @cert_cache ||= CertCache.new(
-        controller_namespace: @controller_namespace || DEFAULT_CONTROLLER_NAMESPACE,
-        controller_name: @controller_name || DEFAULT_CONTROLLER_NAME
-      )
-    end
-
-    def resolve_cached_cert_path
-      return cert_cache.path if !@refresh_cert && cert_cache.exist?
-
-      cert_cache.write(fetch_cert)
+      @cert
     end
 
     # Whether kubeseal's stderr from a failed `--validate` is a validity verdict
@@ -302,81 +272,5 @@ module RKSeal
     def command_label(argv)
       [@binary, *argv].join(" ")
     end
-
-    # On-disk cache for the controller's PUBLIC certificate, so repeated seals do
-    # not each hit the cluster for `--fetch-cert`. The cert is public, hence the
-    # world-readable 0644 perms. One entry per controller identity, under the XDG
-    # cache dir:
-    #   ${XDG_CACHE_HOME:-$HOME/.cache}/rkseal/<namespace>/<name>.pem
-    #
-    # The namespace is a path segment rather than a `<namespace>-<name>` prefix
-    # so two distinct identities can never collide on one file (e.g. `a-b`/`c`
-    # vs `a`/`b-c`); a DNS-1123 name contains no `/`, so the layout is
-    # unambiguous. Writes go through a temp file + atomic rename so a concurrent
-    # seal never reads a half-written cert.
-    #
-    # Defined inline (not a separate file) so this adapter stays self-contained
-    # and adds no new top-level require.
-    class CertCache
-      DIR_PERMS = 0o755
-      FILE_PERMS = 0o644
-
-      # @param controller_namespace [String]
-      # @param controller_name [String]
-      def initialize(controller_namespace:, controller_name:)
-        @controller_namespace = controller_namespace
-        @controller_name = controller_name
-      end
-
-      # @return [String] absolute path to this controller's cached PEM.
-      def path
-        File.join(cache_dir, @controller_namespace, "#{@controller_name}.pem")
-      end
-
-      # @return [Boolean] whether a cached PEM already exists.
-      def exist?
-        File.exist?(path)
-      end
-
-      # @return [String] the cached PEM contents.
-      def read
-        File.read(path)
-      end
-
-      # Persist a freshly fetched PEM (overwriting any existing entry) and return
-      # its path so the caller can hand it to `--cert`.
-      #
-      # @param pem [String] certificate contents.
-      # @return [String] the cache path that now holds the PEM.
-      def write(pem)
-        FileUtils.mkdir_p(File.dirname(path), mode: DIR_PERMS)
-        write_atomically(pem)
-        path
-      end
-
-      private
-
-      # Write the PEM to a uniquely-named temp file in the same directory, then
-      # rename it over the target. rename(2) is atomic within one filesystem, so
-      # a concurrent seal sees either the old cert or the new one -- never a
-      # half-written file. The temp file carries the final 0644 perms and is
-      # removed if the rename never happens (e.g. an error mid-write).
-      def write_atomically(pem)
-        tmp = File.join(File.dirname(path), ".#{File.basename(path)}.#{SecureRandom.hex(8)}.tmp")
-        File.write(tmp, pem)
-        File.chmod(FILE_PERMS, tmp)
-        File.rename(tmp, path)
-      ensure
-        File.unlink(tmp) if tmp && File.exist?(tmp)
-      end
-
-      # ${XDG_CACHE_HOME:-$HOME/.cache}/rkseal
-      def cache_dir
-        base = ENV.fetch("XDG_CACHE_HOME", nil)
-        base = File.join(Dir.home, ".cache") if base.nil? || base.strip.empty?
-        File.join(base, "rkseal")
-      end
-    end
   end
-  # rubocop:enable Metrics/ClassLength
 end
