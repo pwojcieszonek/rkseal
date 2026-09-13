@@ -54,6 +54,21 @@ RSpec.describe RKSeal::Commands::Edit do
   def b64(plain) = Base64.strict_encode64(plain)
 
   describe "#call" do
+    context "when the cluster Secret has an unregistered kubernetes.io/ type" do
+      let(:secret_json) do
+        '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"db","namespace":"app"},' \
+          '"type":"kubernetes.io/foo","data":{"user":"YWxpY2U="}}'
+      end
+      let(:edited_yaml) do
+        "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
+          "type: kubernetes.io/foo\nstringData: { user: bob }\n"
+      end
+
+      it "still edits and re-seals it (the apiserver stores any type string)" do
+        expect(command.call.output_path).to eq(File.expand_path(File.join(output_dir, "db.yaml")))
+      end
+    end
+
     it "reads the live Secret, shows base64 data in the editor, re-seals, and writes the file" do
       buffer = nil
       allow(editor).to receive(:edit) do |content:, **|

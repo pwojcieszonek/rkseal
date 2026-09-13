@@ -126,6 +126,14 @@ RSpec.describe RKSeal::Secret do
         .to include("# Type kubernetes.io/tls: tls.crt and tls.key")
     end
 
+    it "tells the header that data may stay empty for a data-optional type" do
+      typed = described_class.seed(name: "sa", namespace: "app",
+                                   type: "kubernetes.io/service-account-token")
+      header = typed.to_buffer(commented: true)
+      expect(header).to include("Data may stay empty for this type")
+      expect(header).not_to include("An empty buffer")
+    end
+
     it "starts with no data items (empty?)" do
       expect(secret).to be_empty
     end
@@ -466,6 +474,40 @@ RSpec.describe RKSeal::Secret do
       secret = described_class.new(name: "c", namespace: "app", type: "example.com/thing",
                                    data: { "k" => b64("v") })
       expect { secret.validate! }.not_to raise_error
+    end
+
+    it "keeps a cluster Secret with an unregistered kubernetes.io/ type editable" do
+      secret = described_class.from_kubectl_json(
+        { "apiVersion" => "v1", "kind" => "Secret",
+          "metadata" => { "name" => "x", "namespace" => "app" },
+          "type" => "kubernetes.io/foo", "data" => { "k" => b64("v") } }.to_json
+      )
+      expect(secret.to_buffer(commented: true)).to include("# Type kubernetes.io/foo: custom type")
+      expect { secret.validate! }.not_to raise_error
+    end
+
+    it "treats a YAML `type: false` as the default type, as before" do
+      secret = described_class.from_buffer(
+        "apiVersion: v1\nkind: Secret\nmetadata: { name: x, namespace: app }\n" \
+        "type: false\nstringData: { k: v }\n"
+      )
+      expect(secret.type).to eq("Opaque")
+    end
+  end
+
+  describe "#without_empty" do
+    let(:secret) do
+      described_class.new(name: "ba", namespace: "app", type: "kubernetes.io/basic-auth",
+                          data: { "username" => b64("bob"), "password" => "", "note" => "" })
+    end
+
+    it "drops only the listed keys, and only when empty" do
+      trimmed = secret.without_empty(keys: %w[username password])
+      expect(trimmed.data).to eq("username" => b64("bob"), "note" => "")
+    end
+
+    it "returns self when nothing is dropped" do
+      expect(secret.without_empty(keys: %w[username])).to equal(secret)
     end
   end
 

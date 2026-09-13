@@ -24,26 +24,57 @@ RSpec.describe RKSeal::SecretType do
         "bootstrap.kubernetes.io/token"
       )
       described_class.known.each_key do |name|
-        expect(described_class.for(name)).to be_known
+        expect(described_class.for(name).name).to eq(name)
       end
     end
 
     it "accepts a custom type string with no key rules" do
       custom = described_class.for("example.com/my-type")
-      expect(custom).not_to be_known
+      expect(described_class.known).not_to have_key(custom.name)
       expect(custom.required_keys).to be_empty
       expect { custom.validate!(secret(type: "example.com/my-type", data: { "k" => "v" })) }
         .not_to raise_error
     end
 
+    it "is total: an unregistered kubernetes.io/ type resolves to a rule-free custom type" do
+      foo = described_class.for("kubernetes.io/foo")
+      expect(foo.required_keys).to be_empty
+      expect { foo.validate!(secret(type: "kubernetes.io/foo", data: { "k" => "v" })) }
+        .not_to raise_error
+    end
+
+    it "coerces a non-string type and rejects a blank one with InvalidInputError" do
+      expect(described_class.for(123).name).to eq("123")
+      expect { described_class.for(nil) }
+        .to raise_error(RKSeal::InvalidInputError, /must not be empty/)
+      expect { described_class.for("  ") }
+        .to raise_error(RKSeal::InvalidInputError, /must not be empty/)
+    end
+  end
+
+  describe ".for_new" do
+    it "resolves built-in and custom types like .for" do
+      expect(described_class.for_new("kubernetes.io/tls").required_keys).to eq(%w[tls.crt tls.key])
+      expect(described_class.for_new("example.com/my-type").required_keys).to be_empty
+    end
+
     it "rejects an unknown type under the reserved kubernetes.io/ prefix" do
-      expect { described_class.for("kubernetes.io/tsl") }
+      expect { described_class.for_new("kubernetes.io/tsl") }
         .to raise_error(RKSeal::InvalidInputError, %r{unknown Secret type "kubernetes.io/tsl"})
     end
 
     it "rejects an unknown type under bootstrap.kubernetes.io/" do
-      expect { described_class.for("bootstrap.kubernetes.io/tokenz") }
+      expect { described_class.for_new("bootstrap.kubernetes.io/tokenz") }
         .to raise_error(RKSeal::InvalidInputError, /reserved Kubernetes prefix/)
+    end
+  end
+
+  describe "#offline_switchable?" do
+    it "is false only for types whose contract needs annotations" do
+      sa_token = described_class.for("kubernetes.io/service-account-token")
+      expect(sa_token).not_to be_offline_switchable
+      expect(described_class.for("kubernetes.io/tls")).to be_offline_switchable
+      expect(described_class.for("bootstrap.kubernetes.io/token")).to be_offline_switchable
     end
   end
 
@@ -160,9 +191,10 @@ RSpec.describe RKSeal::SecretType do
           .to raise_error(RKSeal::InvalidInputError, /must be a JSON object/)
       end
 
-      it "rejects an object without an auths map" do
-        expect { type.validate!(secret(type: type.name, data: { ".dockerconfigjson" => "{}" })) }
-          .to raise_error(RKSeal::InvalidInputError, /"auths"/)
+      it "accepts a config without auths (credential helpers), as the apiserver does" do
+        helpers = { "credHelpers" => { "1.dkr.ecr.amazonaws.com" => "ecr-login" } }.to_json
+        expect { type.validate!(secret(type: type.name, data: { ".dockerconfigjson" => helpers })) }
+          .not_to raise_error
       end
 
       it "accepts a ~/.docker/config.json payload" do
@@ -204,6 +236,11 @@ RSpec.describe RKSeal::SecretType do
       it "accepts an empty data map once the annotation is set (controller fills the token)" do
         expect { type.validate!(secret(type: type.name, metadata: annotated)) }.not_to raise_error
       end
+
+      it "rejects a non-mapping annotations block with InvalidInputError, not TypeError" do
+        expect { type.validate!(secret(type: type.name, metadata: { "annotations" => [1] })) }
+          .to raise_error(RKSeal::InvalidInputError, /annotations must be a mapping/)
+      end
     end
 
     context "bootstrap.kubernetes.io/token" do
@@ -240,6 +277,15 @@ RSpec.describe RKSeal::SecretType do
 
       it "rejects a name that does not embed the token-id" do
         expect { type.validate!(bootstrap(name: "bootstrap-token-zzzzzz")) }
+          .to raise_error(RKSeal::InvalidInputError, /must be named bootstrap-token-abcdef/)
+      end
+
+      it "checks identity on a partial Secret: namespace always, name only with token-id" do
+        without_id = secret(type: type.name, data: { "token-secret" => "0123456789abcdef" },
+                            name: "bootstrap-token-zzzzzz", namespace: "kube-system")
+        expect { type.validate_identity!(without_id) }.not_to raise_error
+        with_id = bootstrap(data: { "token-id" => "abcdef" }, name: "other")
+        expect { type.validate_identity!(with_id) }
           .to raise_error(RKSeal::InvalidInputError, /must be named bootstrap-token-abcdef/)
       end
     end

@@ -73,12 +73,12 @@ module RKSeal
       opening an editor (useful for TLS/dockerconfig/binary payloads).
 
       --type seeds the buffer with the keys that type requires and validates the
-      result before sealing (kubeseal itself checks nothing; the apiserver would
-      reject the unsealed Secret on the cluster). Built-in types:
+      result before sealing. kubeseal itself checks nothing, and the apiserver
+      would reject the unsealed Secret only on the cluster. Built-in types:
 
       #{SecretType.known.values.map { |t| "  #{t.name}: #{t.hint}" }.join("\n\n")}
 
-      Any other type string is accepted as a custom type without key rules; an
+      Any other type string is accepted as a custom type without key rules. An
       unknown name under kubernetes.io/ is rejected as a typo.
     LONGDESC
     method_option :scope, type: :string, default: "strict",

@@ -104,9 +104,10 @@ module RKSeal
       # @param namespace [String]
       # @param type [String] defaults to {DEFAULT_TYPE}.
       # @return [RKSeal::Secret]
-      # @raise [RKSeal::InvalidInputError] for an unknown built-in type.
+      # @raise [RKSeal::InvalidInputError] for a blank type or an unknown name
+      #   under a reserved Kubernetes prefix (a typo).
       def seed(name:, namespace:, type: DEFAULT_TYPE)
-        secret_type = SecretType.for(type)
+        secret_type = SecretType.for_new(type)
         annotations = secret_type.seed_annotations
         metadata = annotations.empty? ? {} : { "annotations" => annotations }
         new(name: name, namespace: namespace, type: type,
@@ -222,7 +223,7 @@ module RKSeal
         metadata = extract_metadata(doc)
         name = fetch_name(metadata, doc)
         namespace = metadata["namespace"] || doc.dig("metadata", "namespace")
-        type = doc["type"].nil? ? DEFAULT_TYPE : stringify(doc["type"])
+        type = doc["type"] ? stringify(doc["type"]) : DEFAULT_TYPE
 
         new(
           name: name,
@@ -419,6 +420,20 @@ module RKSeal
       data.empty?
     end
 
+    # Return a copy without the given keys when their value is empty. `create`
+    # uses it to discard the seeded placeholders the operator left blank, so an
+    # unfilled `password: ''` never becomes a real (empty) item on the cluster
+    # and a missing required key is reported as missing, not as empty.
+    #
+    # @param keys [Array<String>] the candidate keys (others are never touched).
+    # @return [RKSeal::Secret]
+    def without_empty(keys:)
+      kept = data.reject { |key, value| keys.include?(key) && value.empty? }
+      return self if kept.size == data.size
+
+      self.class.new(name: name, namespace: namespace, type: type, data: kept, metadata: metadata)
+    end
+
     # Assert this Secret satisfies the contract of its `type` (see
     # {RKSeal::SecretType#validate!}). kubeseal does not check this, so rkseal
     # fails fast before sealing a Secret the apiserver would reject.
@@ -430,7 +445,9 @@ module RKSeal
       secret_type.validate!(self)
     end
 
-    # @return [RKSeal::SecretType] the resolved type contract.
+    # @return [RKSeal::SecretType] the resolved type contract (total: an
+    #   unregistered type resolves to a rule-free custom type, so a Secret that
+    #   exists on the cluster is always editable).
     def secret_type
       @secret_type ||= SecretType.for(type)
     end
@@ -525,19 +542,18 @@ module RKSeal
         #     password: my-new-plaintext-secret
         #
         # `type`, labels, and annotations under `metadata` are yours to edit.
-        # An empty buffer (no data and no stringData) is rejected.
+        # #{empty_buffer_rule}
         #
-        # Type #{type}: #{type_hint}
+        # Type #{type}: #{secret_type.hint}
       HEADER
     end
 
-    # One line of type guidance for the buffer header. Resolving the type may
-    # raise for an unknown built-in name; the header must still render (the
-    # error surfaces on validate!), so fall back to a neutral line.
-    def type_hint
-      SecretType.for(type).hint
-    rescue InvalidInputError
-      "unknown type"
+    def empty_buffer_rule
+      if secret_type.data_optional?
+        "Data may stay empty for this type (the cluster fills it in)."
+      else
+        "An empty buffer (no data and no stringData) is rejected."
+      end
     end
   end
   # rubocop:enable Metrics/ClassLength
