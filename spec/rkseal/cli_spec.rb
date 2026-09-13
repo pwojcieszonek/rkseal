@@ -283,10 +283,11 @@ RSpec.describe RKSeal::CLI do
         end
       end
 
-      it "raises InvalidInputError when --from-file does not exist" do
-        args = build_args_for(%w[set app db password --from-file /nonexistent/value])
-        expect { args[:value_source].call }
-          .to raise_error(RKSeal::InvalidInputError, %r{--from-file /nonexistent/value})
+      it "fails (exit 1) before building the command when --from-file does not exist" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        _out, err, status = run_dispatch(%w[set app db password --from-file /nonexistent/value])
+        expect(status).to eq(1)
+        expect(err).to match(%r{--from-file /nonexistent/value})
       end
 
       it "reads piped stdin, dropping one trailing newline" do
@@ -294,12 +295,48 @@ RSpec.describe RKSeal::CLI do
         expect(args[:value_source].call).to eq("s3cret")
       end
 
-      it "falls back to a hidden prompt when stdin is a terminal" do
+      it "falls back to a hidden prompt when stdin is a terminal, keeping the value verbatim" do
         tty = instance_double(IO, tty?: true)
-        allow_any_instance_of(described_class).to receive(:ask)
-          .with(/password/, echo: false).and_return("typed")
+        allow(tty).to receive(:noecho) { |&block| block.call(tty) }
+        allow(tty).to receive(:gets).and_return(" typed \n")
         args = build_args_for(%w[set app db password], stdin: tty)
-        expect(args[:value_source].call).to eq("typed")
+        $stdin = tty
+        begin
+          expect(args[:value_source].call).to eq(" typed ")
+        ensure
+          $stdin = STDIN
+        end
+      end
+
+      it "refuses --deploy without --yes when the value comes from stdin (exit 1)" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        original = $stdin
+        $stdin = StringIO.new("s3cret\n")
+        begin
+          _out, err, status = run_dispatch(%w[set app db password --deploy])
+        ensure
+          $stdin = original
+        end
+        expect(status).to eq(1)
+        expect(err).to match(/read from stdin.*add --yes/)
+      end
+
+      it "allows --deploy --yes with a stdin value" do
+        args = build_args_for(%w[set app db password --deploy --yes], stdin: StringIO.new("v\n"))
+        expect(args).to include(deploy: true, assume_yes: true)
+      end
+
+      it "reports a declined deploy instead of implying success" do
+        allow(RKSeal::Commands::Set).to receive(:new).and_return(set_command)
+        out, = run_dispatch(%w[set app db password v --deploy])
+        expect(out).to match(/Not deployed/)
+      end
+
+      it "does not echo the argv (a mis-quoted VALUE) on an arity error" do
+        _out, err, status = run_dispatch(%w[set app db password my secret])
+        expect(status).to eq(1)
+        expect(err).to include("5 argument(s)")
+        expect(err).not_to include("secret")
       end
 
       it "rejects VALUE combined with --from-file (exit 1)" do

@@ -117,10 +117,15 @@ rkseal set app db password s3cret                 # positional: lands in shell h
 ```
 
 The value is taken from the first available of: the positional `[value]`, `--from-file <path>`,
-piped stdin, a hidden prompt. Values are plaintext; pass `--base64` if the value is already
-base64 (as `view` prints it). Scope, `type`, name and namespace are preserved from the existing
-SealedSecret and cannot be changed here (the kept ciphertext binds them). If neither a local
-file nor a cluster SealedSecret exists, `set` fails fast and points you at `create`.
+piped stdin, a hidden prompt. Every source keeps the value verbatim, except that stdin and the
+prompt drop one trailing newline. Values are plaintext; pass `--base64` if the value is already
+base64 (as `view` prints it; line wraps are ignored). Scope, `type`, name and namespace are
+preserved from the existing SealedSecret and cannot be changed here (the kept ciphertext binds
+them), and a local `<secret-name>.yaml` for a different name/namespace is rejected. If neither
+a local file nor a cluster SealedSecret exists, `set` fails fast and points you at `create`.
+
+A value piped on stdin leaves nothing for the deploy confirmation to read, so `--deploy` then
+requires `--yes`.
 
 - `--from-file <path>` — read the value from a file instead of stdin/prompt.
 - `--base64` — the value is already base64; it is validated and stored as-is.

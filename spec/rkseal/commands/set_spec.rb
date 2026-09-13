@@ -46,14 +46,13 @@ RSpec.describe RKSeal::Commands::Set do
 
   after { FileUtils.remove_entry(output_dir) if File.directory?(output_dir) }
 
-  # Stand in for `kubeseal --merge-into`: rewrite the file as JSON (as v0.36.6
-  # does) with the piped item(s) appended, so the flow's YAML normalisation is
-  # exercised against realistic output.
+  # Stand in for `kubeseal -o yaml --merge-into`: rewrite the file with the
+  # piped item(s) sealed in, keeping every other entry as it was.
   def stub_merge_into
     allow(kubeseal).to receive(:merge_into) do |manifest, file:, **|
       doc = YAML.safe_load_file(file)
       YAML.safe_load(manifest)["data"].each { |k, v| doc["spec"]["encryptedData"][k] = "AgA#{v}" }
-      File.write(file, JSON.generate(doc))
+      File.write(file, YAML.dump(doc))
       nil
     end
   end
@@ -71,23 +70,26 @@ RSpec.describe RKSeal::Commands::Set do
         command.call
       end
 
-      it "probes the cert before reading the value, so a prompt never precedes a failure" do
-        order = []
-        allow(kubeseal).to receive(:ensure_cert!) { order << :cert }
-        source = lambda do
-          order << :value
-          "s3cret"
+      context "when the value source records when it is read" do
+        let(:order) { [] }
+        let(:value_source) do
+          lambda do
+            order << :value
+            "s3cret"
+          end
         end
-        described_class.new(namespace: "app", name: "db", key: key, value_source: source,
-                            kubectl: kubectl, kubeseal: kubeseal, output_dir: output_dir).call
-        expect(order).to eq(%i[cert value])
+
+        it "probes the cert before reading the value, so a prompt never precedes a failure" do
+          allow(kubeseal).to receive(:ensure_cert!) { order << :cert }
+          command.call
+          expect(order).to eq(%i[cert value])
+        end
       end
 
-      it "merges exactly one base64-encoded item, preserving the sourced type and scope" do
+      it "merges exactly one base64-encoded item under the preserved scope" do
         expect(kubeseal).to receive(:merge_into) do |manifest, file:, scope:|
           doc = YAML.safe_load(manifest)
           expect(doc["data"]).to eq("password" => Base64.strict_encode64("s3cret"))
-          expect(doc["type"]).to eq("kubernetes.io/basic-auth")
           expect(doc["metadata"]).to eq("name" => "db", "namespace" => "app")
           expect(file).to eq(written_path)
           expect(scope).to eq(:strict)
@@ -95,15 +97,20 @@ RSpec.describe RKSeal::Commands::Set do
         command.call
       end
 
-      it "re-emits the file as YAML after kubeseal rewrote it as JSON" do
+      it "leaves the merged item in the file and reports the written path" do
         result = command.call
-        text = File.read(written_path)
-        expect(text).to start_with("---\n")
-        expect(YAML.safe_load(text).dig("spec", "encryptedData"))
+        expect(YAML.safe_load_file(written_path).dig("spec", "encryptedData"))
           .to eq("password" => "AgA#{Base64.strict_encode64("s3cret")}",
                  "username" => "AgAusername")
         expect(result).to have_attributes(output_path: File.expand_path(written_path),
                                           deployed: false)
+      end
+
+      it "does not touch the file before the merge when the scope is strict" do
+        expect(kubeseal).to receive(:merge_into) do |_manifest, file:, **|
+          expect(File.read(file)).to eq(local_sealed)
+        end
+        command.call
       end
 
       context "when adding a brand-new key" do
@@ -116,7 +123,22 @@ RSpec.describe RKSeal::Commands::Set do
         end
       end
 
-      context "with a non-strict scope annotation" do
+      context "when the local file belongs to another secret" do
+        let(:local_sealed) do
+          "apiVersion: bitnami.com/v1alpha1\nkind: SealedSecret\n" \
+            "metadata: { name: db, namespace: staging }\n" \
+            "spec:\n  encryptedData: { password: AgAx }\n  template: { type: Opaque }\n"
+        end
+
+        it "refuses rather than sealing under the file's identity" do
+          expect(kubeseal).not_to receive(:merge_into)
+          expect { command.call }
+            .to raise_error(RKSeal::InvalidInputError, %r{belongs to staging/db, not app/db})
+          expect(File.read(written_path)).to eq(local_sealed)
+        end
+      end
+
+      context "with a non-strict scope annotation and no template annotations" do
         let(:local_sealed) do
           <<~YAML
             apiVersion: bitnami.com/v1alpha1
@@ -132,9 +154,12 @@ RSpec.describe RKSeal::Commands::Set do
           YAML
         end
 
-        it "seals the item under the preserved scope" do
-          expect(kubeseal).to receive(:merge_into)
-            .with(anything, file: anything, scope: :cluster_wide)
+        it "seals under the preserved scope with an annotations map kubeseal can write into" do
+          expect(kubeseal).to receive(:merge_into) do |_manifest, file:, scope:|
+            expect(scope).to eq(:cluster_wide)
+            template = YAML.safe_load_file(file).dig("spec", "template")
+            expect(template).to eq("type" => "Opaque", "metadata" => { "annotations" => {} })
+          end
           command.call
         end
       end
@@ -151,6 +176,18 @@ RSpec.describe RKSeal::Commands::Set do
           command.call
         end
 
+        context "when the value is line-wrapped (as `base64`/`openssl base64` emit)" do
+          let(:value_source) { -> { Base64.encode64("x" * 100) } }
+
+          it "accepts it, ignoring the whitespace" do
+            expect(kubeseal).to receive(:merge_into) do |manifest, **|
+              expect(YAML.safe_load(manifest)["data"])
+                .to eq("password" => Base64.strict_encode64("x" * 100))
+            end
+            command.call
+          end
+        end
+
         context "when the value is not valid base64" do
           let(:value_source) { -> { "not*base64" } }
 
@@ -158,6 +195,15 @@ RSpec.describe RKSeal::Commands::Set do
             expect(kubeseal).not_to receive(:merge_into)
             expect { command.call }
               .to raise_error(RKSeal::InvalidInputError, /not valid base64/)
+          end
+        end
+
+        context "when the value is only whitespace" do
+          let(:value_source) { -> { "\n\n" } }
+
+          it "is rejected as empty rather than sealed as an empty value" do
+            expect(kubeseal).not_to receive(:merge_into)
+            expect { command.call }.to raise_error(RKSeal::InvalidInputError, /empty/)
           end
         end
       end
@@ -169,6 +215,14 @@ RSpec.describe RKSeal::Commands::Set do
           expect(kubeseal).not_to receive(:merge_into)
           expect { command.call }.to raise_error(RKSeal::InvalidInputError, /empty/)
           expect(File.read(written_path)).to eq(local_sealed)
+        end
+      end
+
+      context "when the value source itself raises ArgumentError" do
+        let(:value_source) { -> { raise ArgumentError, "invalid byte sequence" } }
+
+        it "propagates it unchanged instead of blaming base64" do
+          expect { command.call }.to raise_error(ArgumentError, "invalid byte sequence")
         end
       end
 
@@ -211,6 +265,15 @@ RSpec.describe RKSeal::Commands::Set do
         allow(kubeseal).to receive(:merge_into).and_raise(RKSeal::CommandError, "boom")
         expect { command.call }.to raise_error(RKSeal::CommandError)
         expect(File).not_to exist(written_path)
+      end
+
+      context "when the operator interrupts at the value prompt" do
+        let(:value_source) { -> { raise Interrupt } }
+
+        it "removes the materialised file too" do
+          expect { command.call }.to raise_error(Interrupt)
+          expect(File).not_to exist(written_path)
+        end
       end
 
       it "fails fast pointing at create when the SealedSecret is absent from the cluster too" do

@@ -45,13 +45,14 @@ RSpec.describe RKSeal::Secret do
 
   describe ".validate_data_key!" do
     it "accepts Kubernetes Secret data keys (letters, digits, '-', '_', '.')" do
-      %w[password tls.crt .dockerconfigjson API_KEY my-key 0].each do |key|
+      %w[password tls.crt .dockerconfigjson API_KEY my-key 0 a..b .hidden].each do |key|
         expect(described_class.validate_data_key!(key)).to eq(key)
       end
     end
 
-    it "rejects empty, oversized, and malformed keys" do
-      ["", "a" * 254, "with space", "slash/key", "colon:key", "ünïcode", "a\nb"]
+    it "rejects empty, oversized, malformed, and directory-escaping keys" do
+      ["", "a" * 254, "with space", "slash/key", "colon:key", "ünïcode", "a\nb", ".", "..",
+       "..hidden"]
         .each do |key|
           expect { described_class.validate_data_key!(key) }
             .to raise_error(RKSeal::InvalidInputError)

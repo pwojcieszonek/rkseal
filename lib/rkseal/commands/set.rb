@@ -22,9 +22,10 @@ module RKSeal
     # as the new local file (merge-into needs a file to merge into). If neither
     # exists, fail fast and point at `create`.
     #
-    # Scope and template `type` are preserved from the sourced SealedSecret and
-    # name/namespace are fixed: the kept ciphertext binds them and cannot be
-    # re-sealed under a different identity without plaintext rkseal never has.
+    # Scope, template `type`, name and namespace come from the sourced
+    # SealedSecret and cannot be changed here: `--merge-into` keeps the file's
+    # template and identity whatever the partial Secret says, and the kept
+    # ciphertext is bound to them anyway.
     #
     # The value is obtained lazily (`value_source.call`) only after the
     # SealedSecret is sourced and the controller cert is confirmed reachable, so
@@ -85,8 +86,8 @@ module RKSeal
       #
       # @return [RKSeal::Commands::Result] outcome (written path, deployed?).
       # @raise [RKSeal::NotFoundError] no local file and no cluster SealedSecret.
-      # @raise [RKSeal::InvalidInputError] empty value, or invalid base64 with
-      #   `base64: true`.
+      # @raise [RKSeal::InvalidInputError] empty value, invalid base64 with
+      #   `base64: true`, or a local file for a different secret.
       # @raise [RKSeal::CommandError] kubeseal/kubectl failed.
       def call
         @kubeseal.ensure_available!
@@ -102,19 +103,33 @@ module RKSeal
       private
 
       # The local `<name>.yaml` is the working copy. Without one, the cluster
-      # object is materialised locally first -- and removed again if the merge
-      # then fails, so an operator never finds an unexplained `<name>.yaml`.
+      # object is materialised locally first -- and removed again unless the
+      # merge completed, whatever interrupted it (kubeseal failure, Ctrl-C at
+      # the prompt), so an operator never finds an unexplained `<name>.yaml`.
       def merge_into_working_copy
-        return merge!(SealedSecret.parse(File.read(manifest_path))) if File.file?(manifest_path)
+        return merge!(parse_local) if File.file?(manifest_path)
 
         @kubectl.ensure_available!
         sealed = materialise_from_cluster
+        merged = false
         begin
           merge!(sealed)
-        rescue Error
-          File.delete(manifest_path) if File.file?(manifest_path)
-          raise
+          merged = true
+        ensure
+          File.delete(manifest_path) unless merged
         end
+      end
+
+      # `--merge-into` seals under the FILE's name/namespace regardless of what
+      # the partial Secret says, so a working copy for another secret would
+      # silently bind (and deploy) the value elsewhere.
+      def parse_local
+        sealed = SealedSecret.parse(File.read(manifest_path))
+        return sealed if sealed.name == @name && sealed.namespace == @namespace
+
+        raise InvalidInputError,
+              "local #{@name}.yaml belongs to #{sealed.namespace}/#{sealed.name}, " \
+              "not #{@namespace}/#{@name}"
       end
 
       # No local working copy: fetch the live SealedSecret and write it as
@@ -133,36 +148,48 @@ module RKSeal
               "Run `rkseal create #{@namespace} #{@name}` first."
       end
 
-      # Seal the one item and merge it into the local file. The cert is probed
-      # before the value is read so a prompt never precedes an inevitable
-      # failure; the partial Secret carries the sourced `type` so the merge
-      # leaves `spec.template.type` unchanged.
+      # Seal the one item and merge it into the local file.
       def merge!(sealed)
         @kubeseal.ensure_cert!
-        partial = Secret.seed(name: @name, namespace: @namespace, type: sealed.type)
+        partial = Secret.seed(name: @name, namespace: @namespace)
                         .with_value(key: @key, contents: plaintext_value)
+        ensure_template_annotations! unless sealed.scope == :strict
         @kubeseal.merge_into(partial.to_manifest(scope: sealed.scope),
                              file: manifest_path, scope: sealed.scope)
-        rewrite_as_yaml(manifest_path)
       end
 
-      # The plaintext bytes to seal. A `base64: true` value is decoded first
-      # (rejecting malformed input) so the model encodes it back canonically.
-      def plaintext_value
-        raw = @value_source.call
-        raise InvalidInputError, "the value for key #{@key.inspect} is empty" if blank?(raw)
-        return raw unless @base64
+      # With a non-strict scope, `kubeseal --merge-into` writes the scope
+      # annotation into `spec.template.metadata.annotations` and panics
+      # (`assignment to entry in nil map`, seen on v0.36.6-v0.38.4) when that map
+      # is absent. kubeseal-authored files carry it; hand-written or templated
+      # ones often do not, so give it an empty map to write into.
+      def ensure_template_annotations!
+        doc = YAML.safe_load_file(manifest_path, permitted_classes: [], aliases: false)
+        metadata = ((doc["spec"] ||= {})["template"] ||= {})["metadata"] ||= {}
+        return if metadata["annotations"].is_a?(Hash)
 
-        Base64.strict_decode64(raw.strip)
+        metadata["annotations"] = {}
+        File.write(manifest_path, YAML.dump(doc))
+      end
+
+      # The plaintext bytes to seal. Emptiness is judged on the decoded value so
+      # a whitespace-only `base64: true` input (which decodes to "") is rejected
+      # like an empty plaintext one.
+      def plaintext_value
+        raw = @value_source.call.to_s
+        value = @base64 ? decode_base64(raw) : raw
+        raise InvalidInputError, "the value for key #{@key.inspect} is empty" if value.empty?
+
+        value
+      end
+
+      # Whitespace is not part of the encoding: `base64`/`openssl base64` wrap
+      # long output in lines, and a pipe adds a newline, so all of it is dropped
+      # before the strict decode.
+      def decode_base64(raw)
+        Base64.strict_decode64(raw.gsub(/\s+/, ""))
       rescue ArgumentError
         raise InvalidInputError, "the value for key #{@key.inspect} is not valid base64"
-      end
-
-      # `kubeseal --merge-into` (v0.36.6) rewrites the file as JSON regardless
-      # of its input format, so re-emit it as YAML to keep `<name>.yaml` honest.
-      def rewrite_as_yaml(path)
-        doc = YAML.safe_load_file(path, permitted_classes: [], aliases: false)
-        File.write(path, YAML.dump(doc))
       end
 
       def manifest_path
@@ -177,10 +204,6 @@ module RKSeal
 
       def context_guard
         @context_guard ||= ContextGuard.new(kubectl: @kubectl, prompt: @prompt)
-      end
-
-      def blank?(value)
-        value.nil? || value.empty?
       end
     end
   end

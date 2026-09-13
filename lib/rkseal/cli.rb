@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "thor"
+require "io/console"
 
 module RKSeal
   # Thor-based command-line interface: parses ARGV, validates options, and
@@ -58,6 +59,16 @@ module RKSeal
           warn(e.message)
           exit(1)
         end
+      end
+
+      # Thor's default echoes the offending argv into the message. `set` takes a
+      # plaintext VALUE positionally, so a mis-quoted value would land in stderr
+      # and every log that captures it; report only the count.
+      def handle_argument_error(command, _error, args, _arity)
+        name = [command.ancestor_name, command.name].compact.join(" ")
+        raise Thor::InvocationError,
+              "ERROR: \"#{basename} #{name}\" was called with #{args.size} argument(s)\n" \
+              "Usage: \"#{banner(command)}\""
       end
     end
 
@@ -184,10 +195,14 @@ module RKSeal
       The value is taken from the first of: the VALUE argument; --from-file
       <path> (byte-exact, binary-safe); standard input when it is not a terminal
       (one trailing newline is dropped, so `echo` works); otherwise a hidden
-      interactive prompt. Prefer stdin, the prompt, or --from-file over VALUE: a
-      positional argument lands in your shell history and is visible to other
-      users via `ps`. The value is plaintext; pass --base64 if it is already
-      base64 (e.g. copied from `view`).
+      interactive prompt (also byte-exact, one trailing newline dropped). Prefer
+      stdin, the prompt, or --from-file over VALUE: a positional argument lands
+      in your shell history and is visible to other users via `ps`. The value is
+      plaintext; pass --base64 if it is already base64 (e.g. copied from `view`;
+      line wraps and other whitespace are ignored).
+
+      A value read from stdin leaves nothing for the deploy confirmation to
+      read, so --deploy then requires --yes.
 
       The SealedSecret comes from the local <NAME>.yaml when present (your
       working copy), otherwise from the live cluster object, which then becomes
@@ -428,20 +443,32 @@ module RKSeal
       ).call
     end
 
-    # Where `set` takes its value from, as a lazy callable so the command can
-    # source the SealedSecret and probe the cert first (nothing is read or
-    # prompted for a run that would fail anyway). Precedence: positional VALUE,
-    # --from-file, piped stdin, hidden prompt.
+    # Where `set` takes its value from, as a callable. Precedence: positional
+    # VALUE, --from-file, piped stdin, hidden prompt. The first two are read
+    # here, so a missing file fails before any cluster or cert work; stdin and
+    # the prompt stay lazy so the command can source the SealedSecret and probe
+    # the cert before anything is read or asked.
     def value_source(key, positional)
       from_file = options["from-file"]
       raise InvalidInputError, "give VALUE or --from-file, not both" if positional && from_file
-      return -> { positional } if positional
-      return -> { read_value_file(from_file) } if from_file
 
-      stdin = $stdin
-      return -> { stdin.read.chomp } unless stdin.tty?
+      value = positional || (from_file && read_value_file(from_file))
+      return -> { value } if value
 
-      -> { ask_hidden("Value for #{key} (input hidden):") }
+      $stdin.tty? ? -> { ask_hidden("Value for #{key} (input hidden): ") } : stdin_source($stdin)
+    end
+
+    # Reading the value consumes stdin, so the deploy confirmation that would
+    # follow reads EOF and Thor treats that as "no" -- a silently skipped deploy
+    # that looks like success. Refuse up front instead.
+    def stdin_source(stdin)
+      if options["deploy"] && !options["yes"]
+        raise InvalidInputError,
+              "the value is read from stdin, so the deploy cannot be confirmed " \
+              "interactively; add --yes"
+      end
+
+      -> { stdin.read.chomp }
     end
 
     def read_value_file(path)
@@ -450,10 +477,14 @@ module RKSeal
       raise InvalidInputError, "--from-file #{path}: #{e.message}"
     end
 
-    # A no-echo prompt swallows the operator's Enter, so terminate the line
-    # ourselves before the outcome is printed.
+    # Not Thor's `ask(echo: false)`: that strips the answer, and a secret must be
+    # taken as typed (one trailing newline dropped). The terminal did not echo
+    # the Enter, so the line is terminated by hand.
     def ask_hidden(question)
-      ask(question, echo: false).tap { say("") }
+      say(question, nil, false)
+      answer = $stdin.noecho(&:gets)
+      say("")
+      answer.to_s.chomp
     end
 
     # Whether a local <NAME>.yaml exists in the working directory (the same path
@@ -541,7 +572,11 @@ module RKSeal
       end
 
       say("Wrote #{result.output_path}")
-      say("Deployed #{result.secret_name} to the cluster.") if result.deployed
+      if result.deployed
+        say("Deployed #{result.secret_name} to the cluster.")
+      elsif options["deploy"]
+        say("Not deployed: confirmation declined.")
+      end
     end
   end
   # rubocop:enable Metrics/ClassLength

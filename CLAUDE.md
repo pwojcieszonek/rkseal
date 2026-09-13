@@ -197,9 +197,9 @@ for both.
    plaintext); `name`/`namespace` are fixed (strict ciphertext binds them, and they are shared
    with the kept entries).
 5. The cluster is touched **only** when a reseal is actually needed — and then only to fetch the
-   controller's **public** cert (unless `--cert`/env supplies it offline). The file is re-emitted as
-   YAML: `kubeseal --merge-into` (v0.36.6) rewrites it as JSON regardless of input format, so
-   `EditLocal` normalizes it back so a `.yaml` always holds YAML.
+   controller's **public** cert (unless `--cert`/env supplies it offline). `kubeseal --merge-into`
+   rewrites the file in its `-o` format (JSON when unset), so the adapter forces `-o yaml`;
+   `EditLocal` then re-emits the document once more to apply removals and the type change.
 6. `--deploy`/`--yes` behave exactly like `edit` (opt-in, `ContextGuard`-gated).
 
 ### `set` flow (inline single-key change, no editor)
@@ -216,18 +216,28 @@ workspace, no cluster Secret read, nothing decrypted. `Commands::Set` is the imp
    the merge then fails.
 2. Probe the cert (`ensure_cert!`) **before** obtaining the value, so a hidden prompt is never
    shown for a run that cannot seal.
-3. Obtain the value lazily from the CLI-resolved source, in precedence order: positional
-   `[value]` (documented as leaking into shell history/`ps`), `--from-file <path>` (byte-exact),
-   piped stdin (one trailing newline chomped so `echo` works), else a hidden `ask(echo: false)`
-   prompt. Plaintext by default; `--base64` decodes and validates first. Empty → fail fast.
-4. Build a one-item `Secret` (`Secret.seed(...).with_value`) carrying the sourced `type`, pipe
-   it through `kubeseal --merge-into <name>.yaml --scope <preserved scope>`, then re-emit the
-   file as YAML (merge-into writes JSON). Existing key → replaced; new key → added; every other
-   entry's ciphertext is untouched.
-5. **Hard constraints:** scope, `type`, `name`, `namespace` are preserved and not overridable
-   (kept ciphertext binds them). The key is validated at the CLI as a Kubernetes Secret data key
-   (`Secret.validate_data_key!`, `[-._a-zA-Z0-9]+`) so an apiserver rejection never waits until
-   deploy. There is no no-op detection: sealing is non-deterministic, so a `set` always writes.
+3. Obtain the value from the CLI-resolved source, in precedence order: positional `[value]`
+   (documented as leaking into shell history/`ps`; Thor's arity error is overridden so a
+   mis-quoted value is never echoed to stderr), `--from-file <path>` (byte-exact; both of these
+   are read eagerly so a typo fails before any cluster work), piped stdin (one trailing newline
+   chomped so `echo` works; **`--deploy` then requires `--yes`**, because the confirmation prompt
+   would read the exhausted stdin as "no" and skip the deploy silently), else a hidden prompt
+   (rkseal's own `noecho` read, not Thor's `ask`, which strips the answer). Plaintext by default;
+   `--base64` drops all whitespace (line-wrapped `base64` output is fine) and strict-decodes.
+   Empty after decoding → fail fast.
+4. Build a one-item `Secret` (`Secret.seed(...).with_value`) and pipe it through
+   `kubeseal --merge-into <name>.yaml --scope <preserved scope> -o yaml`. Existing key →
+   replaced; new key → added; every other entry's ciphertext is untouched. With a non-strict
+   scope, an empty `spec.template.metadata.annotations` map is written first when absent:
+   kubeseal writes the scope annotation there and panics on a nil map (hand-written or
+   Helm-templated files lack it; kubeseal-authored ones carry it).
+5. **Hard constraints:** scope, `type`, `name`, `namespace` are preserved and not overridable —
+   `--merge-into` keeps the file's template and identity whatever the partial Secret says, so a
+   local file for a *different* name/namespace is rejected up front (it would silently bind and
+   deploy the value elsewhere). The key is validated at the CLI as a Kubernetes Secret data key
+   (`Secret.validate_data_key!`: `[-._a-zA-Z0-9]+`, not `.`/`..`, not starting with `..`) so an
+   apiserver rejection never waits until deploy. There is no no-op detection: sealing is
+   non-deterministic, so a `set` always writes.
 6. `--deploy`/`--yes` behave exactly like `edit` (opt-in, `ContextGuard`-gated).
 
 ### `reencrypt` flow
@@ -368,10 +378,10 @@ Settled:
   finds no cluster Secret but a local `<name>.yaml` (no flag), or forced with `--local` (never
   contacts the cluster — for an unreachable one). Operates on the local `<name>.yaml`: existing
   keys are shown `<redacted>`; keep (leave) / reseal (replace or add) / remove (delete) per key
-  via `kubeseal --merge-into`; kept ciphertext stays byte-for-byte. Scope is preserved and
-  `--scope` is rejected; name/namespace are fixed. Output is normalized back to YAML (merge-into
-  emits JSON). The auto-fallback fires only on a definitive `NotFound`. See the offline local
-  edit flow above and `RKSeal::Commands::EditLocal` / `RKSeal::SealedSecret`.
+  via `kubeseal --merge-into -o yaml`; kept ciphertext stays byte-for-byte. Scope is preserved
+  and `--scope` is rejected; name/namespace are fixed. The auto-fallback fires only on a
+  definitive `NotFound`. See the offline local edit flow above and
+  `RKSeal::Commands::EditLocal` / `RKSeal::SealedSecret`.
 - **`create` cert handling:** the controller cert is pre-resolved up front (`--cert`/env, else
   a `--fetch-cert` probe) and fails fast before the editor opens.
 - **No cert cache:** the public cert is never persisted on disk. With no offline source

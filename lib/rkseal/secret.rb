@@ -80,7 +80,9 @@ module RKSeal
     DNS_NAME_MAX_LENGTH = 253
 
     # Kubernetes Secret data key: alphanumerics, `-`, `_`, `.` (same rule as a
-    # ConfigMap key); the apiserver rejects anything else at admission time.
+    # ConfigMap key). The apiserver additionally refuses `.`, `..` and any key
+    # starting with `..` (they would escape the mount directory), checked in
+    # {.validate_data_key!}.
     DATA_KEY_PATTERN = /\A[-._a-zA-Z0-9]+\z/
     # Maximum length of a Secret data key.
     DATA_KEY_MAX_LENGTH = 253
@@ -193,11 +195,11 @@ module RKSeal
           raise InvalidInputError,
                 "key #{key.inspect} is too long (max #{DATA_KEY_MAX_LENGTH} characters)"
         end
-        return key if DATA_KEY_PATTERN.match?(key)
+        return key if DATA_KEY_PATTERN.match?(key) && key != "." && !key.start_with?("..")
 
         raise InvalidInputError,
               "key #{key.inspect} is not a valid Secret data key " \
-              "(letters, digits, '-', '_' and '.')"
+              "(letters, digits, '-', '_' and '.'; not '.' and not starting with '..')"
       end
 
       # Derive the sealing scope from a SealedSecret by inspecting its

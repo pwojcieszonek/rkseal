@@ -149,8 +149,9 @@ module RKSeal
     #
     # The certificate is resolved exactly like {#seal}: an explicit `--cert` is
     # passed through, otherwise kubeseal resolves it itself (env var, else fresh
-    # from the controller). The output format is inherited from the existing
-    # file, so `-o` is NOT forced here.
+    # from the controller). The merged file is rewritten in the `-o` format
+    # (JSON when unset, whatever the input looked like), so `-o yaml` is forced
+    # exactly like {#seal} to keep a `.yaml` holding YAML.
     #
     # @param manifest_yaml [String] Secret manifest with the items to add.
     # @param file [String] path to the existing SealedSecret to merge into.
@@ -158,7 +159,7 @@ module RKSeal
     # @return [void] mutates `file` in place.
     # @raise [RKSeal::CommandError] on kubeseal failure.
     def merge_into(manifest_yaml, file:, scope: :strict)
-      argv = ["--merge-into", file, "--scope", scope_flag(scope)]
+      argv = ["--merge-into", file, "--scope", scope_flag(scope), "-o", "yaml"]
       cert_path = resolved_cert_path
       argv += ["--cert", cert_path] if cert_path
       argv += controller_flags
