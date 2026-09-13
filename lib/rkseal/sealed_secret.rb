@@ -23,6 +23,11 @@ module RKSeal
   #
   # No method here shells out, touches the cluster, or decrypts anything; it is
   # pure data transformation and trivially unit-testable.
+  #
+  # rubocop:disable Metrics/ClassLength -- like {RKSeal::Secret}, this is a
+  # domain model that owns every transformation of its resource (parse, drift
+  # check, runtime-metadata strip, redacted buffer); the lines over the limit
+  # are small, focused helpers, not logic that belongs elsewhere.
   class SealedSecret
     # apiVersion/kind this model represents.
     API_VERSION = "bitnami.com/v1alpha1"
@@ -87,7 +92,39 @@ module RKSeal
         sealed_payload(local) != sealed_payload(cluster)
       end
 
+      # The author-owned form of a SealedSecret fetched from the cluster: the
+      # apiserver's runtime metadata (resourceVersion, uid, managedFields, ...),
+      # the last-applied annotation, and the controller's `status` are dropped.
+      # Needed before the document can become a local working copy: `kubectl
+      # apply` refuses a manifest carrying `managedFields`, and a stale
+      # `resourceVersion` turns a later apply into an optimistic-lock conflict.
+      # The sealed payload (`spec`) is untouched.
+      #
+      # @param document [String, Hash] the cluster SealedSecret (JSON/YAML or Hash).
+      # @return [Hash] a new document, safe to write as `<name>.yaml`.
+      # @raise [RKSeal::InvalidInputError] if the document is empty or not a mapping.
+      def strip_runtime(document)
+        doc = document.is_a?(Hash) ? document : load_yaml(document)
+        unless doc.is_a?(Hash)
+          raise InvalidInputError, "not a SealedSecret manifest (expected a YAML mapping)"
+        end
+
+        cleaned = doc.except("status")
+        metadata = doc["metadata"]
+        cleaned["metadata"] = author_metadata(metadata) if metadata.is_a?(Hash)
+        cleaned
+      end
+
       private
+
+      def author_metadata(metadata)
+        cleaned = metadata.except(*Secret::RUNTIME_METADATA_KEYS)
+        annotations = cleaned["annotations"]
+        return cleaned unless annotations.is_a?(Hash)
+
+        remaining = annotations.except(Secret::LAST_APPLIED_ANNOTATION)
+        remaining.empty? ? cleaned.except("annotations") : cleaned.merge("annotations" => remaining)
+      end
 
       # The comparable sealed payload of a SealedSecret document: its
       # `encryptedData` and `template`. Anything unparseable collapses to a
@@ -201,4 +238,5 @@ module RKSeal
       HEADER
     end
   end
+  # rubocop:enable Metrics/ClassLength
 end

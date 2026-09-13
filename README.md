@@ -13,6 +13,7 @@ path and is destroyed when you are done — it never touches persistent disk.
 ```sh
 rkseal create    <namespace> <secret-name>   # author a new sealed secret
 rkseal edit      <namespace> <secret-name>   # edit an existing one
+rkseal set       <namespace> <secret-name> <key> [value]   # seal one value, no editor
 rkseal reencrypt <namespace> <secret-name>   # rotate to the controller's newest key
 rkseal validate  <namespace> <secret-name>   # check a SealedSecret with the controller
 rkseal view      <namespace> <secret-name>   # print the live Secret (read-only)
@@ -28,6 +29,11 @@ rkseal version                               # print the installed rkseal versio
   **automatically to an offline local edit** (see [`edit --local`](#edit---local-offline)).
   Only if **neither** the cluster Secret nor a local file exists does it fail fast and point
   you at `create`.
+- `set` seals **one** value into an existing SealedSecret without opening an editor. Only that
+  key is re-sealed (`kubeseal --merge-into`); every other entry's ciphertext is kept
+  byte-for-byte and nothing is decrypted. An existing key is replaced, a new key is added.
+  It works on the local `<secret-name>.yaml` if present, otherwise on the live SealedSecret
+  (which then becomes the local file). See [`set`](#set-flags--value-sources).
 - `reencrypt` rotates an existing SealedSecret onto the controller's current sealing key
   (`kubeseal --re-encrypt`) without exposing plaintext. It reads the local
   `<secret-name>.yaml` if present, otherwise the live SealedSecret; if neither exists it
@@ -41,9 +47,9 @@ rkseal version                               # print the installed rkseal versio
 - `list` prints a table of the SealedSecret objects in the cluster (columns **NAMESPACE,
   NAME, SCOPE, AGE**). Give a `[namespace]` to scope it to one namespace; omit it to list all.
   **Read-only and metadata-only** — it never prints encrypted data (not even the data keys).
-- `create`, `edit`, and `reencrypt` write `<secret-name>.yaml` into the current working
-  directory. `edit` and `reencrypt` can deploy with `kubectl apply`, but **only** with an
-  explicit opt-in flag, and only after confirming the active kube context.
+- `create`, `edit`, `set`, and `reencrypt` write `<secret-name>.yaml` into the current
+  working directory. `edit`, `set`, and `reencrypt` can deploy with `kubectl apply`, but
+  **only** with an explicit opt-in flag, and only after confirming the active kube context.
 
 In the `edit` buffer, `data:` values are shown as **base64, verbatim** — they are never
 decoded to plaintext. To change a value readably, add it under a `stringData:` block; on
@@ -101,6 +107,26 @@ online `edit`.
 - The controller certificate is resolved up front, so an unreachable controller fails fast
   **before** you start editing.
 
+### `set` flags & value sources
+
+```sh
+echo -n 's3cret' | rkseal set app db password     # from stdin (one trailing newline dropped)
+rkseal set app db tls.crt --from-file ./tls.crt   # byte-exact, binary-safe
+rkseal set app db password                        # hidden interactive prompt (stdin is a TTY)
+rkseal set app db password s3cret                 # positional: lands in shell history and `ps`
+```
+
+The value is taken from the first available of: the positional `[value]`, `--from-file <path>`,
+piped stdin, a hidden prompt. Values are plaintext; pass `--base64` if the value is already
+base64 (as `view` prints it). Scope, `type`, name and namespace are preserved from the existing
+SealedSecret and cannot be changed here (the kept ciphertext binds them). If neither a local
+file nor a cluster SealedSecret exists, `set` fails fast and points you at `create`.
+
+- `--from-file <path>` — read the value from a file instead of stdin/prompt.
+- `--base64` — the value is already base64; it is validated and stored as-is.
+- `--deploy` / `--yes` — same deploy semantics as `edit`.
+- `--cert`, `--controller-name`, `--controller-namespace`.
+
 ### `reencrypt` flags
 
 - `--deploy` / `--yes` — same deploy semantics as `edit` (opt-in, context-confirmed; `--yes`
@@ -120,7 +146,7 @@ online `edit`.
 
 ### Controller certificate
 
-`create`, `edit`, `reencrypt`, and `validate` resolve the controller's public cert from, in
+`create`, `edit`, `set`, `reencrypt`, and `validate` resolve the controller's public cert from, in
 order: `--cert <file|URL>`, the `SEALED_SECRETS_CERT` env var (both offline — nothing is
 contacted), otherwise a fresh `--fetch-cert` from the live controller. **The cert is never
 cached on disk** — it is re-fetched every run, so a seal is always bound to the current kube
@@ -158,6 +184,9 @@ a cluster. Real cluster operations are reserved for explicit integration tests g
   asks you to confirm before `kubectl apply`. There is no in-code allow-list — `rkseal` uses
   whatever context is active — so switch context deliberately before deploying (`--yes`
   bypasses only the prompt, not the `--deploy` opt-in).
+- **A positional `set` value is the one exception.** `rkseal set … <key> <value>` puts the
+  plaintext into your shell history and into the process list for every user on the host.
+  Prefer stdin, the hidden prompt, or `--from-file` outside throwaway environments.
 - **Names are validated at the boundary.** `<namespace>` and `<secret-name>` must be valid
   Kubernetes DNS-1123 names; anything else (path traversal like `../`, a leading `-` that
   could be read as a `kubectl`/`kubeseal` flag, `/`, uppercase, …) is rejected up front,

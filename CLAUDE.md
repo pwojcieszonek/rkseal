@@ -6,11 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `rkseal` is a Ruby gem that wraps the `kubeseal` CLI to create and edit Kubernetes
 [Sealed Secrets](https://github.com/bitnami-labs/sealed-secrets) interactively, in the
-spirit of `knife vault create/edit`. Six commands:
+spirit of `knife vault create/edit`. Seven commands:
 
 ```
 rkseal create    <namespace> <secret-name>   # author a new sealed secret
 rkseal edit      <namespace> <secret-name>   # edit an existing one (auto-offline if not on cluster)
+rkseal set       <namespace> <secret-name> <key> [value]   # seal one value inline, no editor
 rkseal reencrypt <namespace> <secret-name>   # rotate onto the controller's current key
 rkseal validate  [<namespace> <secret-name>] # controller pre-flight check (--file <path>)
 rkseal view      <namespace> <secret-name>   # print the live Secret (--reveal to decode)
@@ -19,11 +20,12 @@ rkseal list      [<namespace>]               # list SealedSecrets (metadata only
 
 `create`/`edit` open the secret's plaintext in `$EDITOR` for interactive editing (or skip the
 editor with `--no-edit` when values are pre-seeded via `--from-file`). The resulting
-`SealedSecret` manifest is written to the **current working directory**. `edit` and
-`reencrypt` can optionally deploy the change to the cluster, but deploying is **never the
-default** — it is an explicit opt-in flag. `validate`, `view`, and `list` are read-only.
+`SealedSecret` manifest is written to the **current working directory**. `set` seals a single
+key without any editor (see its flow below). `edit`, `set`, and `reencrypt` can optionally
+deploy the change to the cluster, but deploying is **never the default** — it is an explicit
+opt-in flag. `validate`, `view`, and `list` are read-only.
 
-**Status: shipped (MVP complete).** All six commands are implemented, the full RSpec suite is
+**Status: shipped (MVP complete).** All seven commands are implemented, the full RSpec suite is
 green, and RuboCop is clean. The sections below describe the architecture as built and the
 hard constraints it respects. They also encode domain knowledge (how Sealed Secrets actually
 work) that is non-obvious and easy to get wrong.
@@ -100,8 +102,8 @@ A clean separation between *orchestration* (the command flows) and *adapters* (t
 over external binaries) — each independently testable and mockable:
 
 - `RKSeal::CLI` — argument/command parsing, dispatch, DNS-1123 name/namespace validation.
-- `RKSeal::Commands::{Create,Edit,EditLocal,Reencrypt,Validate,View,List}` — orchestrate one
-  flow each (`EditLocal` is the offline `edit --local`; see below).
+- `RKSeal::Commands::{Create,Edit,EditLocal,Set,Reencrypt,Validate,View,List}` — orchestrate
+  one flow each (`EditLocal` is the offline `edit --local`; see below).
 - `RKSeal::Kubeseal` — adapter over the `kubeseal` binary (`ensure_cert!`, `seal`,
   `fetch_cert`, `re_encrypt`, `validate`). Owns scope/cert/controller flags. `ensure_cert!` is
   a fail-fast reachability probe (`--fetch-cert`, result discarded); the cert is never cached —
@@ -114,7 +116,8 @@ over external binaries) — each independently testable and mockable:
   convert between the cluster representation and the friendly key→value edit buffer.
 - `RKSeal::SealedSecret` — domain model for the *SealedSecret* resource: read a local
   `<name>.yaml`'s data **keys** (the map keys are plaintext), scope annotation, and template
-  `type`, and render the *redacted* `edit --local` buffer. It never decrypts anything.
+  `type`, render the *redacted* `edit --local` buffer, and strip a cluster-fetched object down
+  to its author-owned form (`strip_runtime`). It never decrypts anything.
 - `RKSeal::ContextGuard` — surfaces the active kube context before a deploy and asks the
   operator to confirm it (no allow-list; `--yes` skips the prompt for pipelines).
 
@@ -197,6 +200,34 @@ for both.
    controller's **public** cert (unless `--cert`/env supplies it offline). The file is re-emitted as
    YAML: `kubeseal --merge-into` (v0.36.6) rewrites it as JSON regardless of input format, so
    `EditLocal` normalizes it back so a `.yaml` always holds YAML.
+6. `--deploy`/`--yes` behave exactly like `edit` (opt-in, `ContextGuard`-gated).
+
+### `set` flow (inline single-key change, no editor)
+
+`rkseal set <namespace> <secret-name> <key> [value]` seals **one** value into an existing
+SealedSecret. It is the blind `--merge-into` primitive exposed directly: no editor, no RAM
+workspace, no cluster Secret read, nothing decrypted. `Commands::Set` is the implementation.
+
+1. Source the SealedSecret exactly like `reencrypt`: the local `<name>.yaml` if present (the
+   working copy), else `kubectl get sealedsecret` — stripped of apiserver runtime metadata and
+   `status` via `SealedSecret.strip_runtime` (`kubectl apply` refuses `managedFields`, and a
+   stale `resourceVersion` would conflict later) and written as the new `<name>.yaml`. Neither
+   → **fail fast**, point at `create`. A file materialised from the cluster is deleted again if
+   the merge then fails.
+2. Probe the cert (`ensure_cert!`) **before** obtaining the value, so a hidden prompt is never
+   shown for a run that cannot seal.
+3. Obtain the value lazily from the CLI-resolved source, in precedence order: positional
+   `[value]` (documented as leaking into shell history/`ps`), `--from-file <path>` (byte-exact),
+   piped stdin (one trailing newline chomped so `echo` works), else a hidden `ask(echo: false)`
+   prompt. Plaintext by default; `--base64` decodes and validates first. Empty → fail fast.
+4. Build a one-item `Secret` (`Secret.seed(...).with_value`) carrying the sourced `type`, pipe
+   it through `kubeseal --merge-into <name>.yaml --scope <preserved scope>`, then re-emit the
+   file as YAML (merge-into writes JSON). Existing key → replaced; new key → added; every other
+   entry's ciphertext is untouched.
+5. **Hard constraints:** scope, `type`, `name`, `namespace` are preserved and not overridable
+   (kept ciphertext binds them). The key is validated at the CLI as a Kubernetes Secret data key
+   (`Secret.validate_data_key!`, `[-._a-zA-Z0-9]+`) so an apiserver rejection never waits until
+   deploy. There is no no-op detection: sealing is non-deterministic, so a `set` always writes.
 6. `--deploy`/`--yes` behave exactly like `edit` (opt-in, `ContextGuard`-gated).
 
 ### `reencrypt` flow
@@ -326,7 +357,9 @@ Settled:
   Secret's `type`/`metadata`). On `edit`, the live Secret's `data` is shown as raw base64
   (verbatim, not decoded) by default; plaintext goes under `stringData`, and `--string-data`
   decodes the whole buffer to plaintext `stringData`.
-- **Commands (shipped):** `create`, `edit` (incl. offline `--local`, see below), `reencrypt`
+- **Commands (shipped):** `create`, `edit` (incl. offline `--local`, see below), `set` (inline
+  single-key change over `--merge-into`; value from positional/`--from-file`/stdin/hidden
+  prompt; scope/type/identity preserved; see the `set` flow above), `reencrypt`
   (rotate onto the current key; `--deploy`/`--yes`), `validate` (controller
   pre-flight, read-only; `--file <path>`), `view` (print live Secret,
   read-only; `--reveal` decodes to plaintext `stringData`), `list` (read-only, metadata-only
