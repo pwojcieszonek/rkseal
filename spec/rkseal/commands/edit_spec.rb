@@ -106,12 +106,14 @@ RSpec.describe RKSeal::Commands::Edit do
         cluster_wide = '{"kind":"SealedSecret","metadata":{"annotations":' \
                        '{"sealedsecrets.bitnami.com/cluster-wide":"true"}}}'
         allow(kubectl).to receive(:get_sealedsecret).and_return(cluster_wide)
-        expect(kubeseal).to receive(:seal).with(anything, scope: :cluster_wide).and_return(sealed)
+        expect(kubeseal).to receive(:seal)
+          .with(anything, hash_including(scope: :cluster_wide)).and_return(sealed)
         command.call
       end
 
       it "defaults to strict when the cluster SealedSecret has no scope annotation" do
-        expect(kubeseal).to receive(:seal).with(anything, scope: :strict).and_return(sealed)
+        expect(kubeseal).to receive(:seal)
+          .with(anything, hash_including(scope: :strict)).and_return(sealed)
         command.call
       end
 
@@ -124,7 +126,8 @@ RSpec.describe RKSeal::Commands::Edit do
           kubectl: kubectl, kubeseal: kubeseal, editor: editor,
           context_guard: context_guard, prompt: prompt, workspace: workspace, output_dir: output_dir
         )
-        expect(kubeseal).to receive(:seal).with(anything, scope: :namespace_wide).and_return(sealed)
+        expect(kubeseal).to receive(:seal)
+          .with(anything, hash_including(scope: :namespace_wide)).and_return(sealed)
         expect(kubectl).not_to receive(:get_sealedsecret)
         cmd.call
       end
@@ -141,14 +144,16 @@ RSpec.describe RKSeal::Commands::Edit do
         YAML
         allow(kubectl).to receive(:get_sealedsecret)
           .and_raise(RKSeal::NotFoundError, "absent")
-        expect(kubeseal).to receive(:seal).with(anything, scope: :namespace_wide).and_return(sealed)
+        expect(kubeseal).to receive(:seal)
+          .with(anything, hash_including(scope: :namespace_wide)).and_return(sealed)
         command.call
       end
 
       it "defaults to strict when both the cluster read and the local file are unavailable" do
         allow(kubectl).to receive(:get_sealedsecret)
           .and_raise(RKSeal::CommandError.new("unreachable"))
-        expect(kubeseal).to receive(:seal).with(anything, scope: :strict).and_return(sealed)
+        expect(kubeseal).to receive(:seal)
+          .with(anything, hash_including(scope: :strict)).and_return(sealed)
         command.call
       end
     end

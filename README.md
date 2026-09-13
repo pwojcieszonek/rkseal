@@ -101,6 +101,30 @@ online `edit`.
 - The controller certificate is resolved up front, so an unreachable controller fails fast
   **before** you start editing.
 
+### Secret types
+
+`--type` (default `Opaque`) does two things: it seeds the `create` buffer with the keys the
+type requires, and it validates the saved Secret against the type's contract before sealing.
+`kubeseal` checks none of this; without the check a broken Secret is rejected only when the
+controller unseals it, visible solely in controller events. Every built-in type is supported:
+
+| Type | rkseal seeds / enforces |
+|---|---|
+| `Opaque` | any keys; at least one data item |
+| `kubernetes.io/service-account-token` | annotation `kubernetes.io/service-account.name`; `data` may be empty (the token controller fills `token`, `ca.crt`, `namespace`) |
+| `kubernetes.io/dockercfg` | `.dockercfg`, a JSON object (legacy `~/.dockercfg`) |
+| `kubernetes.io/dockerconfigjson` | `.dockerconfigjson`, a JSON object with an `auths` map (`~/.docker/config.json`) |
+| `kubernetes.io/basic-auth` | `username` and/or `password`, at least one non-empty |
+| `kubernetes.io/ssh-auth` | `ssh-privatekey` |
+| `kubernetes.io/tls` | `tls.crt` and `tls.key` (optional `ca.crt`) |
+| `bootstrap.kubernetes.io/token` | `token-id` (6 × `[a-z0-9]`) and `token-secret` (16 × `[a-z0-9]`); the Secret must be named `bootstrap-token-<token-id>` in `kube-system` |
+
+Seeded keys carry an empty value; a required key left empty is rejected on save. Any other
+type string is accepted as a custom type with no key rules, except that an unknown name under
+`kubernetes.io/` (or `bootstrap.kubernetes.io/`) is rejected as a typo. The offline
+`edit --local` applies the same presence rules to the resulting key set (kept ciphertext
+exposes only its keys) and the value rules to the keys it re-seals.
+
 ### `reencrypt` flags
 
 - `--deploy` / `--yes` — same deploy semantics as `edit` (opt-in, context-confirmed; `--yes`

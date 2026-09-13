@@ -98,7 +98,7 @@ module RKSeal
         plan = build_plan(sealed, edit(sealed))
         return unchanged_result unless plan.changes?
 
-        ensure_nonempty!(sealed, plan)
+        validate_plan!(sealed, plan)
         apply(plan, scope: sealed.scope)
 
         path = File.expand_path(manifest_path)
@@ -224,13 +224,16 @@ module RKSeal
         end
       end
 
-      # The final key set must not be empty (a Secret with no data is invalid).
-      def ensure_nonempty!(sealed, plan)
-        remaining = (sealed.encrypted_keys - plan.removed_keys) +
-                    plan.reseal_string_data.keys + plan.reseal_data.keys
-        return unless remaining.uniq.empty?
-
-        raise InvalidInputError, "the edit would leave the SealedSecret with no data items"
+      # Enforce the (possibly edited) type's contract on what the file will hold:
+      # the presence rules over the final key set (kept ciphertext exposes only
+      # its keys) and the value rules over the items being resealed, which are
+      # the only plaintext this flow ever sees.
+      def validate_plan!(sealed, plan)
+        secret_type = SecretType.for(plan.type)
+        remaining = (sealed.encrypted_keys - plan.removed_keys) |
+                    plan.reseal_string_data.keys | plan.reseal_data.keys
+        secret_type.validate_keys!(remaining)
+        secret_type.validate_values!(reseal_secret(plan).data) if plan.reseal?
       end
 
       # Apply the plan to `<name>.yaml`: merge resealed items via kubeseal, then

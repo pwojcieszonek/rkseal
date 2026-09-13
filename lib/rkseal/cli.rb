@@ -71,20 +71,30 @@ module RKSeal
       Pre-seed values with --from-file key=path (repeatable; binary-safe, stored
       as base64). Pass --no-edit to seal the pre-seeded Secret directly without
       opening an editor (useful for TLS/dockerconfig/binary payloads).
+
+      --type seeds the buffer with the keys that type requires and validates the
+      result before sealing (kubeseal itself checks nothing; the apiserver would
+      reject the unsealed Secret on the cluster). Built-in types:
+
+      #{SecretType.known.values.map { |t| "  #{t.name}: #{t.hint}" }.join("\n\n")}
+
+      Any other type string is accepted as a custom type without key rules; an
+      unknown name under kubernetes.io/ is rejected as a typo.
     LONGDESC
     method_option :scope, type: :string, default: "strict",
                           enum: %w[strict namespace-wide cluster-wide],
                           desc: "Sealing scope bound into the ciphertext"
     method_option :type, type: :string, default: Secret::DEFAULT_TYPE,
-                         desc: "Secret type (e.g. Opaque, kubernetes.io/tls)"
+                         desc: "Secret type (built-in, e.g. kubernetes.io/tls, or custom)"
     method_option :cert, type: :string,
                          desc: "Controller certificate (file or URL); else --fetch-cert/env is used"
     method_option :"controller-name", type: :string,
                                       desc: "sealed-secrets controller name"
     method_option :"controller-namespace", type: :string,
                                            desc: "controller namespace"
-    method_option :"from-file", type: :array,
-                                desc: "Pre-seed key=path value(s) into the buffer before editing"
+    method_option :"from-file", type: :array, repeatable: true,
+                                desc: "Pre-seed key=path value(s) into the buffer before editing " \
+                                      "(repeat the flag or list several pairs after one)"
     method_option :"no-edit", type: :boolean, default: false,
                               desc: "Seal the pre-seeded Secret directly, without opening $EDITOR"
     method_option :"string-data", type: :boolean, default: false,
@@ -401,15 +411,18 @@ module RKSeal
       value.nil? ? nil : SCOPE_SYMBOLS.fetch(value)
     end
 
-    # Parse repeatable `--from-file key=path` tokens into a {key => path} Hash.
-    # Splitting on the first "=" only keeps paths that contain "=" intact.
+    # Parse `--from-file key=path` tokens into a {key => path} Hash. Thor hands a
+    # repeatable array option over as one array per flag occurrence, so both
+    # `--from-file a=x b=y` and `--from-file a=x --from-file b=y` are flattened
+    # into the same list. Splitting on the first "=" only keeps paths that
+    # contain "=" intact.
     #
     # @return [Hash{String=>String}, nil] nil when the flag was not given.
     def parsed_from_file
       entries = options["from-file"]
       return nil if entries.nil?
 
-      entries.each_with_object({}) do |entry, acc|
+      entries.flatten.each_with_object({}) do |entry, acc|
         key, path = entry.split("=", 2)
         if key.nil? || key.empty? || path.nil? || path.empty?
           raise InvalidInputError, "--from-file expects key=path, got #{entry.inspect}"

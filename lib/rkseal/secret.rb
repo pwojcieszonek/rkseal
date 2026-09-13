@@ -50,7 +50,7 @@ module RKSeal
     # Kubernetes apiVersion/kind this model represents.
     API_VERSION = "v1"
     KIND = "Secret"
-    DEFAULT_TYPE = "Opaque"
+    DEFAULT_TYPE = SecretType::OPAQUE
 
     # `metadata` keys that the apiserver/controller populate at runtime and that
     # must be stripped before a Secret is re-sealed, so the buffer shows only
@@ -63,13 +63,6 @@ module RKSeal
     # Annotation kubectl injects that embeds the previous object (including its
     # data) -- must be dropped so a stale copy of the secret is never re-sealed.
     LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
-
-    # Required data keys per well-known Secret type. kubeseal does not validate
-    # these (the failure would only surface on-cluster), so rkseal fails fast.
-    REQUIRED_KEYS_BY_TYPE = {
-      "kubernetes.io/tls" => %w[tls.crt tls.key],
-      "kubernetes.io/dockerconfigjson" => %w[.dockerconfigjson]
-    }.freeze
 
     # Kubernetes DNS-1123 subdomain: lowercase alphanumerics, `-` and `.`
     # internally, must start and end alphanumeric. Anchored so a leading `-`
@@ -101,16 +94,23 @@ module RKSeal
     attr_reader :metadata
 
     class << self
-      # Build the seed manifest for `rkseal create`: a minimal, valid Secret
-      # skeleton (correct apiVersion/kind/type, name + namespace filled in, no
-      # data) intended to be rendered to a commented template the user fills in.
+      # Build the seed manifest for `rkseal create`: a Secret skeleton (correct
+      # apiVersion/kind/type, name + namespace filled in) intended to be rendered
+      # to a commented template the user fills in. The keys and annotations the
+      # type mandates are pre-seeded with empty values (see
+      # {RKSeal::SecretType#seed_data}); Opaque seeds no keys.
       #
       # @param name [String]
       # @param namespace [String]
       # @param type [String] defaults to {DEFAULT_TYPE}.
       # @return [RKSeal::Secret]
+      # @raise [RKSeal::InvalidInputError] for an unknown built-in type.
       def seed(name:, namespace:, type: DEFAULT_TYPE)
-        new(name: name, namespace: namespace, type: type)
+        secret_type = SecretType.for(type)
+        annotations = secret_type.seed_annotations
+        metadata = annotations.empty? ? {} : { "annotations" => annotations }
+        new(name: name, namespace: namespace, type: type,
+            data: secret_type.seed_data, metadata: metadata)
       end
 
       # Build a Secret from the JSON `kubectl get secret -o json` returns.
@@ -222,7 +222,7 @@ module RKSeal
         metadata = extract_metadata(doc)
         name = fetch_name(metadata, doc)
         namespace = metadata["namespace"] || doc.dig("metadata", "namespace")
-        type = doc["type"] || DEFAULT_TYPE
+        type = doc["type"].nil? ? DEFAULT_TYPE : stringify(doc["type"])
 
         new(
           name: name,
@@ -419,21 +419,20 @@ module RKSeal
       data.empty?
     end
 
-    # Assert this Secret satisfies the required-key contract for its `type`.
-    # Opaque imposes no requirement; TLS/dockerconfigjson do. kubeseal does not
-    # check this, so rkseal fails fast before sealing an on-cluster-broken Secret.
+    # Assert this Secret satisfies the contract of its `type` (see
+    # {RKSeal::SecretType#validate!}). kubeseal does not check this, so rkseal
+    # fails fast before sealing a Secret the apiserver would reject.
     #
     # @return [void]
-    # @raise [RKSeal::InvalidInputError] if a required key for {#type} is absent.
+    # @raise [RKSeal::InvalidInputError] on a violated rule, or on an empty data
+    #   map for a type that does not allow one.
     def validate!
-      raise InvalidInputError, "the Secret has no data items" if empty?
+      secret_type.validate!(self)
+    end
 
-      missing = REQUIRED_KEYS_BY_TYPE.fetch(type, []).reject { |key| data.key?(key) }
-      return if missing.empty?
-
-      raise InvalidInputError,
-            "Secret type #{type.inspect} requires #{missing.join(", ")} " \
-            "(present: #{data.keys.sort.join(", ")})"
+    # @return [RKSeal::SecretType] the resolved type contract.
+    def secret_type
+      @secret_type ||= SecretType.for(type)
     end
 
     # Value equality over the author-owned fields (name, namespace, type, data,
@@ -527,7 +526,18 @@ module RKSeal
         #
         # `type`, labels, and annotations under `metadata` are yours to edit.
         # An empty buffer (no data and no stringData) is rejected.
+        #
+        # Type #{type}: #{type_hint}
       HEADER
+    end
+
+    # One line of type guidance for the buffer header. Resolving the type may
+    # raise for an unknown built-in name; the header must still render (the
+    # error surfaces on validate!), so fall back to a neutral line.
+    def type_hint
+      SecretType.for(type).hint
+    rescue InvalidInputError
+      "unknown type"
     end
   end
   # rubocop:enable Metrics/ClassLength

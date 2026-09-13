@@ -233,6 +233,49 @@ RSpec.describe RKSeal::Commands::EditLocal do
         end
       end
 
+      context "when the type is changed to one the kept keys cannot satisfy" do
+        let(:edited_buffer) do
+          <<~YAML
+            apiVersion: v1
+            kind: Secret
+            metadata: { name: db, namespace: app }
+            type: kubernetes.io/tls
+            stringData:
+              password: <redacted>
+              username: <redacted>
+          YAML
+        end
+
+        it "refuses before touching the file or kubeseal" do
+          expect { command.call }
+            .to raise_error(RKSeal::InvalidInputError, /requires tls\.crt, tls\.key/)
+          expect(kubeseal).not_to have_received(:merge_into)
+          expect(File.read(written_path)).to eq(local_sealed)
+        end
+      end
+
+      context "when a resealed value breaks the type's value rule" do
+        let(:local_sealed) do
+          <<~YAML
+            apiVersion: bitnami.com/v1alpha1
+            kind: SealedSecret
+            metadata: { name: db, namespace: app }
+            spec:
+              encryptedData: { .dockerconfigjson: AgAcfg }
+              template: { type: kubernetes.io/dockerconfigjson }
+          YAML
+        end
+        let(:edited_buffer) do
+          "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
+            "type: kubernetes.io/dockerconfigjson\nstringData: { .dockerconfigjson: not-json }\n"
+        end
+
+        it "refuses to reseal invalid JSON" do
+          expect { command.call }.to raise_error(RKSeal::InvalidInputError, /not valid JSON/)
+          expect(kubeseal).not_to have_received(:merge_into)
+        end
+      end
+
       context "when the scope is non-strict" do
         let(:local_sealed) do
           <<~YAML
