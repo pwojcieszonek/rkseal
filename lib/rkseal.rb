@@ -14,6 +14,10 @@ require_relative "rkseal/version"
 #                                (errors.rb)
 #
 # Domain:
+#   RKSeal::SecretType        -- registry of built-in Secret types and the
+#                                key/annotation/value contract each imposes;
+#                                seeds and validates typed Secrets
+#                                (secret_type.rb)
 #   RKSeal::Secret            -- build/parse the k8s Secret manifest, base64
 #                                encode/decode, strip runtime metadata, convert
 #                                between cluster JSON and the edit buffer
@@ -66,6 +70,7 @@ end
 require_relative "rkseal/errors"
 
 # Domain models.
+require_relative "rkseal/secret_type"
 require_relative "rkseal/secret"
 require_relative "rkseal/sealed_secret"
 

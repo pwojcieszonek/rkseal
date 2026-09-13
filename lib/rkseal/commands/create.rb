@@ -70,16 +70,24 @@ module RKSeal
       #   unreachable with no offline cert (surfaced up front, before editing).
       def call
         @kubeseal.ensure_available!
+        # Seeding validates the type and reads --from-file sources, so it runs
+        # before the cert probe: local input errors need no cluster round-trip.
+        secret_type = SecretType.for_new(@type)
+        secret = preseeded_secret(secret_type)
         # Resolve the cert before the editor/workspace open: an unreachable
         # controller (and no offline cert) must fail fast, not after the user has
         # spent time editing a buffer that can never be sealed.
         @kubeseal.ensure_cert!
 
-        secret = preseeded_secret
         secret = edit(secret) unless @no_edit
+        # A seeded placeholder the operator left blank is not an item they asked
+        # for; drop it so it is reported as missing rather than sealed empty.
+        secret = secret.without_empty(keys: secret_type.seed_data.keys)
         secret.validate!
 
-        path = write_manifest(@kubeseal.seal(secret.to_manifest(scope: @scope), scope: @scope))
+        sealed = @kubeseal.seal(secret.to_manifest(scope: @scope), scope: @scope,
+                                                                   allow_empty_data: secret.empty?)
+        path = write_manifest(sealed)
         Result.new(secret_name: @name, namespace: @namespace, output_path: path, deployed: false)
       end
 
@@ -88,9 +96,9 @@ module RKSeal
       # Seed an empty Secret and fold every `--from-file` value into it. Reading
       # the file lives here (not in the adapter or model): the model stays pure,
       # and a missing path fails fast with an actionable message.
-      def preseeded_secret
+      def preseeded_secret(secret_type)
         @from_file.reduce(Secret.seed(name: @name, namespace: @namespace,
-                                      type: @type)) do |secret, (key, path)|
+                                      type: secret_type.name)) do |secret, (key, path)|
           secret.with_value(key: key, contents: read_source(key, path))
         end
       end

@@ -90,6 +90,31 @@ It also went stale on controller rekey/reinstall. Fetching fresh costs one sub-s
 `--fetch-cert` per invocation and removes both failure modes; GitOps/CI that wants offline,
 reproducible seals pins `--cert`/`SEALED_SECRETS_CERT` instead (strictly better than a cache).
 
+### Secret types
+
+`RKSeal::SecretType` enforces each built-in `type`'s contract client-side, before sealing,
+because kubeseal checks nothing and the apiserver rejects a broken Secret only after unsealing
+(visible solely in controller events). Invariants that no test will catch if broken:
+
+- **Rules must never exceed what the apiserver enforces on a stored Secret.** Anything
+  stricter (e.g. demanding an `auths` map in `.dockerconfigjson`) makes `edit` refuse a Secret
+  that legally exists on the cluster, and the operator has no override in `edit`.
+- **`SecretType.for` is total; `SecretType.for_new` is the typo gate.** The apiserver stores
+  any `type` string, including unknown `kubernetes.io/*` names, so resolving a type read from
+  the cluster or a file must never raise. Only operator-chosen types (`--type`, a type edited
+  into a buffer) go through `for_new`, which rejects unknown reserved-prefix names.
+- **A seeded placeholder left empty is dropped, not sealed** (`Secret#without_empty` in
+  `create`), so a missing required key is reported as missing and an unfilled optional key
+  (basic-auth `password`) never becomes an empty item on the cluster.
+- **`edit --local` cannot verify annotation contracts** (the redacted buffer carries none), so
+  it refuses to switch a file to a type with `required_annotations`. It does run the value and
+  identity rules on the resealed items.
+- **Error messages never echo a value.** `JSON::ParserError#message` quotes the input, so it
+  is deliberately not surfaced.
+- kubeseal aborts on empty `data` unless `--allow-empty-data`; `Kubeseal#seal` takes
+  `allow_empty_data:` and the flows pass `secret.empty?`, which `validate!` has already
+  restricted to data-optional types (service-account-token).
+
 ### Key rotation
 
 Controllers rotate sealing keys (~30 days). Old keys still decrypt old SealedSecrets.
@@ -114,6 +139,10 @@ over external binaries) — each independently testable and mockable:
   guarantees its destruction.
 - `RKSeal::Secret` — domain model: build the k8s `Secret` manifest, base64 encode/decode,
   convert between the cluster representation and the friendly key→value edit buffer.
+- `RKSeal::SecretType` — registry of the built-in Secret `type`s and the contract each
+  imposes (required / any-of keys, required annotations, value rules, name/namespace
+  binding). Seeds the typed `create` buffer and backs `Secret#validate!`; see **Secret
+  types** below.
 - `RKSeal::SealedSecret` — domain model for the *SealedSecret* resource: read a local
   `<name>.yaml`'s data **keys** (the map keys are plaintext), scope annotation, and template
   `type`, render the *redacted* `edit --local` buffer, and strip a cluster-fetched object down
@@ -362,8 +391,8 @@ Settled:
   `string_data:` on `Secret#to_buffer`/`SealedSecret#to_buffer` and the command classes.
 - **MVP scope = full (shipped):** Opaque + multiline values + load-value-from-file
   (`--from-file key=path`, repeatable, binary-safe) + `--no-edit` (seal the pre-seeded Secret
-  without opening `$EDITOR`) + Secret `type`s (e.g. `kubernetes.io/tls`,
-  `kubernetes.io/dockerconfigjson`) + `spec.template` (kubeseal derives it from the input
+  without opening `$EDITOR`) + every built-in Secret `type` (see **Secret types** below) +
+  `spec.template` (kubeseal derives it from the input
   Secret's `type`/`metadata`). On `edit`, the live Secret's `data` is shown as raw base64
   (verbatim, not decoded) by default; plaintext goes under `stringData`, and `--string-data`
   decodes the whole buffer to plaintext `stringData`.

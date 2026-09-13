@@ -130,6 +130,16 @@ RSpec.describe RKSeal::Kubeseal do
       expect(captured[:argv].each_cons(2)).to include(%w[--scope cluster-wide])
     end
 
+    it "passes --allow-empty-data only when asked (kubeseal aborts on empty data otherwise)" do
+      captured = stub_run
+      kubeseal.seal("kind: Secret\n")
+      expect(captured[:argv]).not_to include("--allow-empty-data")
+
+      captured = stub_run
+      kubeseal.seal("kind: Secret\n", allow_empty_data: true)
+      expect(captured[:argv]).to include("--allow-empty-data")
+    end
+
     it "passes the explicit --cert (and never fetches) when one is configured" do
       adapter = described_class.new(binary: "kubeseal", cert: "/certs/pub.pem")
       allow(adapter).to receive(:fetch_cert)

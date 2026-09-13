@@ -71,6 +71,13 @@ RSpec.describe RKSeal::CLI do
           .with(hash_including(from_file: { "cert" => "/p/cert.pem", "key" => "/p/tls.key" }))
       end
 
+      it "accumulates a repeated --from-file flag instead of keeping only the last one" do
+        allow(RKSeal::Commands::Create).to receive(:new).and_return(command)
+        run_dispatch(%w[create app db --from-file tls.crt=/p/c.pem --from-file tls.key=/p/k.pem])
+        expect(RKSeal::Commands::Create).to have_received(:new)
+          .with(hash_including(from_file: { "tls.crt" => "/p/c.pem", "tls.key" => "/p/k.pem" }))
+      end
+
       it "keeps paths that contain '=' intact (splits on the first '=' only)" do
         allow(RKSeal::Commands::Create).to receive(:new).and_return(command)
         run_dispatch(["create", "app", "db", "--from-file", "k=/p/a=b.pem"])
