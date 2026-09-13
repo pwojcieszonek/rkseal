@@ -91,19 +91,20 @@ module RKSeal
     # @param manifest_yaml [String] a full Secret manifest (from
     #   {RKSeal::Secret#to_manifest}).
     # @param scope [Symbol] one of {SCOPES} keys; defaults to :strict.
+    # @param allow_empty_data [Boolean] pass `--allow-empty-data`; kubeseal
+    #   otherwise aborts on a Secret with no data, which is legitimate only for
+    #   types the cluster fills in itself (a service-account token).
     # @return [String] SealedSecret YAML.
     # @raise [RKSeal::InvalidInputError] if scope is unknown.
     # @raise [RKSeal::CommandError] if kubeseal exits non-zero (e.g. controller
     #   unreachable, bad cert).
-    def seal(manifest_yaml, scope: :strict)
+    def seal(manifest_yaml, scope: :strict, allow_empty_data: false)
       # `-o yaml` is mandatory: kubeseal defaults to JSON, so without it the
       # output written to `<name>.yaml` would actually contain JSON.
       argv = ["--scope", scope_flag(scope), "-o", "yaml"]
-      cert_path = resolved_cert_path
-      argv += ["--cert", cert_path] if cert_path
-      argv += controller_flags
+      argv << "--allow-empty-data" if allow_empty_data
 
-      run(*argv, stdin: manifest_yaml)
+      run(*argv, *cert_and_controller_flags, stdin: manifest_yaml)
     end
 
     # Validate that a SealedSecret can be decrypted by the controller
@@ -158,12 +159,8 @@ module RKSeal
     # @return [void] mutates `file` in place.
     # @raise [RKSeal::CommandError] on kubeseal failure.
     def merge_into(manifest_yaml, file:, scope: :strict)
-      argv = ["--merge-into", file, "--scope", scope_flag(scope)]
-      cert_path = resolved_cert_path
-      argv += ["--cert", cert_path] if cert_path
-      argv += controller_flags
-
-      run(*argv, stdin: manifest_yaml)
+      run("--merge-into", file, "--scope", scope_flag(scope), *cert_and_controller_flags,
+          stdin: manifest_yaml)
       nil
     end
 
@@ -181,6 +178,13 @@ module RKSeal
     end
 
     private
+
+    # `--cert <path>` when an explicit source is configured (else kubeseal resolves
+    # the cert itself), followed by the controller name/namespace flags.
+    def cert_and_controller_flags
+      cert_path = resolved_cert_path
+      (cert_path ? ["--cert", cert_path] : []) + controller_flags
+    end
 
     # Translate a scope symbol into its kubeseal `--scope` argument.
     #

@@ -70,16 +70,20 @@ module RKSeal
       #   unreachable with no offline cert (surfaced up front, before editing).
       def call
         @kubeseal.ensure_available!
+        # Seeding validates the type and reads --from-file sources, so it runs
+        # before the cert probe: local input errors need no cluster round-trip.
+        secret = preseeded_secret
         # Resolve the cert before the editor/workspace open: an unreachable
         # controller (and no offline cert) must fail fast, not after the user has
         # spent time editing a buffer that can never be sealed.
         @kubeseal.ensure_cert!
 
-        secret = preseeded_secret
         secret = edit(secret) unless @no_edit
         secret.validate!
 
-        path = write_manifest(@kubeseal.seal(secret.to_manifest(scope: @scope), scope: @scope))
+        sealed = @kubeseal.seal(secret.to_manifest(scope: @scope), scope: @scope,
+                                                                   allow_empty_data: secret.empty?)
+        path = write_manifest(sealed)
         Result.new(secret_name: @name, namespace: @namespace, output_path: path, deployed: false)
       end
 

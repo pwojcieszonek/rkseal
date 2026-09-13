@@ -92,7 +92,7 @@ RSpec.describe RKSeal::Commands::Create do
         namespace: "app", name: "db", scope: :cluster_wide,
         kubeseal: kubeseal, editor: editor, workspace: workspace, output_dir: output_dir
       )
-      expect(kubeseal).to receive(:seal) do |manifest, scope:|
+      expect(kubeseal).to receive(:seal) do |manifest, scope:, **|
         expect(scope).to eq(:cluster_wide)
         expect(YAML.safe_load(manifest).fetch("data")).to eq("user" => b64("alice"))
         sealed
@@ -193,6 +193,63 @@ RSpec.describe RKSeal::Commands::Create do
           "type: kubernetes.io/tls\nstringData: { tls.crt: only-cert }\n"
         )
         expect { command.call }.to raise_error(RKSeal::InvalidInputError, /tls\.key/)
+      end
+
+      it "opens the editor on a buffer pre-seeded with the type's required keys" do
+        command.call
+        expect(editor).to have_received(:edit)
+          .with(hash_including(content: a_string_matching(/tls\.crt: ''\n\s+tls\.key: ''/)))
+      end
+
+      it "rejects a required key left at its empty seed value" do
+        allow(editor).to receive(:edit).and_return(
+          "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
+          "type: kubernetes.io/tls\nstringData: { tls.crt: cert, tls.key: '' }\n"
+        )
+        expect { command.call }.to raise_error(RKSeal::InvalidInputError, /"tls\.key" is empty/)
+      end
+
+      it "seals when --from-file supplies both keys with --no-edit" do
+        crt = File.join(output_dir, "tls.crt")
+        key = File.join(output_dir, "tls.key")
+        File.write(crt, "CERT")
+        File.write(key, "KEY")
+        typed = described_class.new(
+          namespace: "app", name: "db", type: type, no_edit: true,
+          from_file: { "tls.crt" => crt, "tls.key" => key },
+          kubeseal: kubeseal, editor: editor, workspace: workspace, output_dir: output_dir
+        )
+        typed.call
+        expect(kubeseal).to have_received(:seal)
+          .with(a_string_including("tls.crt: #{b64("CERT")}"),
+                scope: :strict, allow_empty_data: false)
+      end
+    end
+
+    context "with a service-account token" do
+      let(:type) { "kubernetes.io/service-account-token" }
+
+      it "seals an empty data map once the annotation is filled in" do
+        allow(editor).to receive(:edit).and_return(
+          "apiVersion: v1\nkind: Secret\n" \
+          "metadata: { name: db, namespace: app, " \
+          "annotations: { kubernetes.io/service-account.name: builder } }\n" \
+          "type: kubernetes.io/service-account-token\ndata: {}\n"
+        )
+        command.call
+        expect(kubeseal).to have_received(:seal)
+          .with(a_string_including("kubernetes.io/service-account.name: builder"),
+                scope: :strict, allow_empty_data: true)
+      end
+    end
+
+    context "with an unknown built-in type" do
+      let(:type) { "kubernetes.io/tsl" }
+
+      it "fails before contacting the controller or opening the editor" do
+        expect { command.call }.to raise_error(RKSeal::InvalidInputError, /unknown Secret type/)
+        expect(kubeseal).not_to have_received(:ensure_cert!)
+        expect(editor).not_to have_received(:edit)
       end
     end
   end

@@ -100,6 +100,32 @@ RSpec.describe RKSeal::Secret do
       expect(secret.type).to eq("Opaque")
     end
 
+    it "pre-seeds the keys a typed Secret requires, with empty values" do
+      typed = described_class.seed(name: "tls", namespace: "app", type: "kubernetes.io/tls")
+      expect(typed.data).to eq("tls.crt" => "", "tls.key" => "")
+      buffer = YAML.safe_load(typed.to_buffer)
+      expect(buffer).to include("data" => { "tls.crt" => "", "tls.key" => "" })
+    end
+
+    it "pre-seeds the required annotation for a service-account token" do
+      typed = described_class.seed(name: "sa", namespace: "app",
+                                   type: "kubernetes.io/service-account-token")
+      expect(typed).to be_empty
+      expect(YAML.safe_load(typed.to_buffer).dig("metadata", "annotations"))
+        .to eq("kubernetes.io/service-account.name" => "")
+    end
+
+    it "rejects an unknown built-in type up front" do
+      expect { described_class.seed(name: "x", namespace: "app", type: "kubernetes.io/tsl") }
+        .to raise_error(RKSeal::InvalidInputError, /unknown Secret type/)
+    end
+
+    it "mentions the type contract in the commented header" do
+      typed = described_class.seed(name: "tls", namespace: "app", type: "kubernetes.io/tls")
+      expect(typed.to_buffer(commented: true))
+        .to include("# Type kubernetes.io/tls: tls.crt and tls.key")
+    end
+
     it "starts with no data items (empty?)" do
       expect(secret).to be_empty
     end
@@ -426,6 +452,19 @@ RSpec.describe RKSeal::Secret do
     it "passes a complete TLS Secret" do
       secret = described_class.new(name: "t", namespace: "app", type: "kubernetes.io/tls",
                                    data: { "tls.crt" => b64("c"), "tls.key" => b64("k") })
+      expect { secret.validate! }.not_to raise_error
+    end
+
+    it "delegates the whole contract to SecretType (annotation rule as a probe)" do
+      secret = described_class.new(name: "sa", namespace: "app",
+                                   type: "kubernetes.io/service-account-token")
+      expect { secret.validate! }
+        .to raise_error(RKSeal::InvalidInputError, /service-account\.name/)
+    end
+
+    it "accepts a custom type with no rules" do
+      secret = described_class.new(name: "c", namespace: "app", type: "example.com/thing",
+                                   data: { "k" => b64("v") })
       expect { secret.validate! }.not_to raise_error
     end
   end

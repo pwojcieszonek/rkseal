@@ -108,7 +108,8 @@ module RKSeal
         edited.validate!
         effective_scope = @scope || resolve_scope
         path = write_manifest(@kubeseal.seal(edited.to_manifest(scope: effective_scope),
-                                             scope: effective_scope))
+                                             scope: effective_scope,
+                                             allow_empty_data: edited.empty?))
         deployed = @deploy && deploy_confirmed?
         @kubectl.apply(file: path) if deployed
         Result.new(secret_name: @name, namespace: @namespace, output_path: path, deployed: deployed)
