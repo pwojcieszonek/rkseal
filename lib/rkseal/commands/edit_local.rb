@@ -268,10 +268,8 @@ module RKSeal
       end
 
       # Apply the plan to `<name>.yaml`: merge resealed items via kubeseal, then
-      # always normalize the file -- drop removed keys, update the template type,
-      # and re-emit YAML. The normalize pass is unconditional because
-      # `kubeseal --merge-into` (v0.36.6) rewrites the file as JSON regardless of
-      # the input format, so a `.yaml` would otherwise be left holding JSON.
+      # normalize the file -- drop removed keys, update the template type, and
+      # re-emit the document in rkseal's own YAML layout rather than kubeseal's.
       def apply(plan, partial, scope:)
         path = manifest_path
         if plan.reseal?
@@ -297,9 +295,8 @@ module RKSeal
         Secret.from_buffer(YAML.dump(manifest))
       end
 
-      # Re-read the SealedSecret kubeseal just wrote (JSON or YAML -- YAML parses
-      # both), apply the removals and the optional type change, and write it back
-      # as YAML so a `.yaml` always holds YAML.
+      # Re-read the SealedSecret kubeseal just wrote, apply the removals and the
+      # optional type change, and write it back.
       def normalize_file(path, plan)
         doc = YAML.safe_load_file(path, permitted_classes: [], aliases: false)
         spec = doc["spec"] ||= {}

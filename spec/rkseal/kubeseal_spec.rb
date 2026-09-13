@@ -343,15 +343,15 @@ RSpec.describe RKSeal::Kubeseal do
   end
 
   describe "#merge_into" do
-    it "blind-appends encrypted items to an existing SealedSecret file without forcing -o" do
+    it "blind-appends encrypted items to an existing SealedSecret file, rewriting it as YAML" do
       captured = stub_run
 
       kubeseal.merge_into("kind: Secret\n", file: "db.yaml", scope: :strict)
 
       expect(captured[:argv].each_cons(2)).to include(%w[--merge-into db.yaml])
       expect(captured[:stdin]).to eq("kind: Secret\n")
-      # Output format is inherited from the existing file -- do NOT force -o.
-      expect(captured[:argv]).not_to include("-o")
+      # kubeseal rewrites the merged file in the -o format (JSON by default).
+      expect(captured[:argv].each_cons(2)).to include(%w[-o yaml])
     end
 
     it "returns nil (mutation in place, nothing to hand back)" do

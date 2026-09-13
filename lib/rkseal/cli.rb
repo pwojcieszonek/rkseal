@@ -1,12 +1,13 @@
 # frozen_string_literal: true
 
 require "thor"
+require "io/console"
 
 module RKSeal
   # Thor-based command-line interface: parses ARGV, validates options, and
   # dispatches to the orchestration commands. It is intentionally thin -- it
-  # maps flags/positionals onto {RKSeal::Commands::Create} /
-  # {RKSeal::Commands::Edit}, prints their {RKSeal::Commands::Result}, and turns
+  # maps flags/positionals onto the {RKSeal::Commands} classes ({Create},
+  # {Edit}, {Set}, ...), prints their {RKSeal::Commands::Result}, and turns
   # the gem's fail-fast {RKSeal::Error}s into a single clean line + non-zero
   # exit. No business logic lives here.
   #
@@ -58,6 +59,16 @@ module RKSeal
           warn(e.message)
           exit(1)
         end
+      end
+
+      # Thor's default echoes the offending argv into the message. `set` takes a
+      # plaintext VALUE positionally, so a mis-quoted value would land in stderr
+      # and every log that captures it; report only the count.
+      def handle_argument_error(command, _error, args, _arity)
+        name = [command.ancestor_name, command.name].compact.join(" ")
+        raise Thor::InvocationError,
+              "ERROR: \"#{basename} #{name}\" was called with #{args.size} argument(s)\n" \
+              "Usage: \"#{banner(command)}\""
       end
     end
 
@@ -181,6 +192,69 @@ module RKSeal
     def edit(namespace, name)
       validate_identifiers!(namespace, name)
       result = options["local"] ? edit_local(namespace, name) : edit_auto(namespace, name)
+      report(result)
+    end
+
+    desc "set NAMESPACE NAME KEY [VALUE]", "Seal one value into a SealedSecret, without an editor"
+    long_desc <<~LONGDESC
+      Seals a single key's value into an existing SealedSecret and writes
+      <NAME>.yaml, without opening $EDITOR. Only that key is (re)sealed: every
+      other entry's ciphertext is kept byte-for-byte (kubeseal --merge-into) and
+      nothing is decrypted. An existing key is replaced; a new key is added.
+
+      The value is taken from the first of: the VALUE argument; --from-file
+      <path> (byte-exact, binary-safe); standard input when it is not a terminal
+      (one trailing newline is dropped, so `echo` works); otherwise a hidden
+      interactive prompt (also byte-exact, one trailing newline dropped). Prefer
+      stdin, the prompt, or --from-file over VALUE: a positional argument lands
+      in your shell history and is visible to other users via `ps`. The value is
+      plaintext; pass --base64 if it is already base64 (e.g. copied from `view`;
+      line wraps and other whitespace are ignored).
+
+      A value read from stdin leaves nothing for the deploy confirmation to
+      read, so --deploy then requires --yes.
+
+      The SealedSecret comes from the local <NAME>.yaml when present (your
+      working copy), otherwise from the live cluster object, which then becomes
+      <NAME>.yaml. Scope, type, name, and namespace are preserved and cannot be
+      changed here. If neither a local file nor a cluster SealedSecret exists,
+      rkseal fails fast and points you at `create`.
+
+      Deploy is opt-in exactly like `edit`: --deploy runs `kubectl apply` after
+      surfacing the active kube context and asking you to confirm; --yes skips
+      the prompt in non-interactive pipelines.
+    LONGDESC
+    method_option :"from-file", type: :string,
+                                desc: "Read the value from this file (byte-exact, binary-safe)"
+    method_option :base64, type: :boolean, default: false,
+                           desc: "The value is already base64 (stored as-is after validation)"
+    method_option :deploy, type: :boolean, default: false,
+                           desc: "Apply the result to the cluster after writing (opt-in)"
+    method_option :yes, type: :boolean, default: false,
+                        desc: "Skip the deploy confirmation prompt (only with --deploy)"
+    method_option :cert, type: :string,
+                         desc: "Controller certificate (file or URL); else --fetch-cert/env is used"
+    method_option :"controller-name", type: :string,
+                                      desc: "sealed-secrets controller name"
+    method_option :"controller-namespace", type: :string,
+                                           desc: "controller namespace"
+    # Seal one value into an existing SealedSecret (no editor).
+    #
+    # @param namespace [String] target namespace.
+    # @param name [String] Secret name (also the output filename stem).
+    # @param key [String] data key to set.
+    # @param value [String, nil] the value; nil to read it from --from-file,
+    #   stdin, or a hidden prompt.
+    # @return [void]
+    def set(namespace, name, key, value = nil)
+      validate_identifiers!(namespace, name)
+      Secret.validate_data_key!(key)
+      result = Commands::Set.new(
+        namespace: namespace, name: name, key: key,
+        value_source: value_source(key, value), base64: options["base64"],
+        deploy: options["deploy"], assume_yes: options["yes"],
+        kubectl: Kubectl.new, kubeseal: build_kubeseal
+      ).call
       report(result)
     end
 
@@ -379,6 +453,50 @@ module RKSeal
       ).call
     end
 
+    # Where `set` takes its value from, as a callable. Precedence: positional
+    # VALUE, --from-file, piped stdin, hidden prompt. The first two are read
+    # here, so a missing file fails before any cluster or cert work; stdin and
+    # the prompt stay lazy so the command can source the SealedSecret and probe
+    # the cert before anything is read or asked.
+    def value_source(key, positional)
+      from_file = options["from-file"]
+      raise InvalidInputError, "give VALUE or --from-file, not both" if positional && from_file
+
+      value = positional || (from_file && read_value_file(from_file))
+      return -> { value } if value
+
+      $stdin.tty? ? -> { ask_hidden("Value for #{key} (input hidden): ") } : stdin_source($stdin)
+    end
+
+    # Reading the value consumes stdin, so the deploy confirmation that would
+    # follow reads EOF and Thor treats that as "no" -- a silently skipped deploy
+    # that looks like success. Refuse up front instead.
+    def stdin_source(stdin)
+      if options["deploy"] && !options["yes"]
+        raise InvalidInputError,
+              "the value is read from stdin, so the deploy cannot be confirmed " \
+              "interactively; add --yes"
+      end
+
+      -> { stdin.read.chomp }
+    end
+
+    def read_value_file(path)
+      File.binread(path)
+    rescue SystemCallError => e
+      raise InvalidInputError, "--from-file #{path}: #{e.message}"
+    end
+
+    # Not Thor's `ask(echo: false)`: that strips the answer, and a secret must be
+    # taken as typed (one trailing newline dropped). The terminal did not echo
+    # the Enter, so the line is terminated by hand.
+    def ask_hidden(question)
+      say(question, nil, false)
+      answer = $stdin.noecho(&:gets)
+      say("")
+      answer.to_s.chomp
+    end
+
     # Whether a local <NAME>.yaml exists in the working directory (the same path
     # the commands read/write), making an offline fallback possible.
     def local_manifest?(name)
@@ -467,7 +585,11 @@ module RKSeal
       end
 
       say("Wrote #{result.output_path}")
-      say("Deployed #{result.secret_name} to the cluster.") if result.deployed
+      if result.deployed
+        say("Deployed #{result.secret_name} to the cluster.")
+      elsif options["deploy"]
+        say("Not deployed: confirmation declined.")
+      end
     end
   end
   # rubocop:enable Metrics/ClassLength

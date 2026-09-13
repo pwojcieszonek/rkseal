@@ -8,9 +8,9 @@ RSpec.describe RKSeal::CLI do
   end
 
   describe "command surface" do
-    it "exposes create/edit/reencrypt/validate/view/list (and version) commands" do
+    it "exposes create/edit/set/reencrypt/validate/view/list (and version) commands" do
       expect(described_class.all_commands.keys)
-        .to include("create", "edit", "reencrypt", "validate", "view", "list", "version")
+        .to include("create", "edit", "set", "reencrypt", "validate", "view", "list", "version")
     end
 
     it "documents NAMESPACE NAME usage for create" do
@@ -245,6 +245,128 @@ RSpec.describe RKSeal::CLI do
           expect(err).to match(/rkseal create/)
           expect(RKSeal::Commands::EditLocal).not_to have_received(:new)
         end
+      end
+    end
+
+    describe "set mapping" do
+      let(:set_command) { instance_double(RKSeal::Commands::Set, call: result) }
+
+      # Capture the keyword args Commands::Set was built with, so the lazy
+      # value_source can be invoked and asserted on.
+      def build_args_for(argv, stdin: StringIO.new)
+        captured = nil
+        allow(RKSeal::Commands::Set).to receive(:new) do |**kw|
+          captured = kw
+          set_command
+        end
+        original = $stdin
+        $stdin = stdin
+        run_dispatch(argv)
+        captured
+      ensure
+        $stdin = original
+      end
+
+      it "maps `set app db password` onto Commands::Set and prints the path" do
+        allow(RKSeal::Commands::Set).to receive(:new).and_return(set_command)
+        out, = run_dispatch(%w[set app db password s3cret])
+        expect(RKSeal::Commands::Set).to have_received(:new)
+          .with(hash_including(namespace: "app", name: "db", key: "password",
+                               base64: false, deploy: false, assume_yes: false))
+        expect(out).to include("/cwd/db.yaml")
+      end
+
+      it "uses the positional VALUE as the value source" do
+        args = build_args_for(%w[set app db password s3cret])
+        expect(args[:value_source].call).to eq("s3cret")
+      end
+
+      it "reads the value byte-exact from --from-file" do
+        Dir.mktmpdir do |dir|
+          file = File.join(dir, "value.bin")
+          File.binwrite(file, "\x00\xFFraw\n")
+          args = build_args_for(["set", "app", "db", "password", "--from-file", file])
+          expect(args[:value_source].call).to eq("\x00\xFFraw\n".b)
+        end
+      end
+
+      it "fails (exit 1) before building the command when --from-file does not exist" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        _out, err, status = run_dispatch(%w[set app db password --from-file /nonexistent/value])
+        expect(status).to eq(1)
+        expect(err).to match(%r{--from-file /nonexistent/value})
+      end
+
+      it "reads piped stdin, dropping one trailing newline" do
+        args = build_args_for(%w[set app db password], stdin: StringIO.new("s3cret\n"))
+        expect(args[:value_source].call).to eq("s3cret")
+      end
+
+      it "falls back to a hidden prompt when stdin is a terminal, keeping the value verbatim" do
+        tty = instance_double(IO, tty?: true)
+        allow(tty).to receive(:noecho) { |&block| block.call(tty) }
+        allow(tty).to receive(:gets).and_return(" typed \n")
+        args = build_args_for(%w[set app db password], stdin: tty)
+        $stdin = tty
+        begin
+          expect(args[:value_source].call).to eq(" typed ")
+        ensure
+          $stdin = STDIN
+        end
+      end
+
+      it "refuses --deploy without --yes when the value comes from stdin (exit 1)" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        original = $stdin
+        $stdin = StringIO.new("s3cret\n")
+        begin
+          _out, err, status = run_dispatch(%w[set app db password --deploy])
+        ensure
+          $stdin = original
+        end
+        expect(status).to eq(1)
+        expect(err).to match(/read from stdin.*add --yes/)
+      end
+
+      it "allows --deploy --yes with a stdin value" do
+        args = build_args_for(%w[set app db password --deploy --yes], stdin: StringIO.new("v\n"))
+        expect(args).to include(deploy: true, assume_yes: true)
+      end
+
+      it "reports a declined deploy instead of implying success" do
+        allow(RKSeal::Commands::Set).to receive(:new).and_return(set_command)
+        out, = run_dispatch(%w[set app db password v --deploy])
+        expect(out).to match(/Not deployed/)
+      end
+
+      it "does not echo the argv (a mis-quoted VALUE) on an arity error" do
+        _out, err, status = run_dispatch(%w[set app db password my secret])
+        expect(status).to eq(1)
+        expect(err).to include("5 argument(s)")
+        expect(err).not_to include("secret")
+      end
+
+      it "rejects VALUE combined with --from-file (exit 1)" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        _out, err, status = run_dispatch(%w[set app db password v --from-file /x])
+        expect(status).to eq(1)
+        expect(err).to match(/VALUE or --from-file, not both/)
+      end
+
+      it "maps --base64, --deploy, and --yes through" do
+        allow(RKSeal::Commands::Set).to receive(:new).and_return(set_command)
+        run_dispatch(%w[set app db password v --base64 --deploy --yes])
+        expect(RKSeal::Commands::Set).to have_received(:new)
+          .with(hash_including(base64: true, deploy: true, assume_yes: true))
+      end
+
+      it "validates the identifiers and the key before building the command" do
+        expect(RKSeal::Commands::Set).not_to receive(:new)
+        _out, _err, status = run_dispatch(["set", "app", "../bad", "password", "v"])
+        expect(status).to eq(1)
+        _out, err, status = run_dispatch(["set", "app", "db", "bad key", "v"])
+        expect(status).to eq(1)
+        expect(err).to match(/not a valid Secret data key/)
       end
     end
 

@@ -48,6 +48,7 @@ require_relative "rkseal/version"
 #   RKSeal::Commands::Edit    -- the `edit` flow (commands/edit.rb)
 #   RKSeal::Commands::EditLocal -- the offline `edit --local` flow
 #                                (commands/edit_local.rb)
+#   RKSeal::Commands::Set       -- the `set` flow (commands/set.rb)
 #   RKSeal::Commands::Reencrypt -- the `reencrypt` flow (commands/reencrypt.rb)
 #   RKSeal::Commands::Validate  -- the `validate` flow (commands/validate.rb)
 #   RKSeal::Commands::View      -- the `view` flow (commands/view.rb)
@@ -87,6 +88,7 @@ require_relative "rkseal/commands/result"
 require_relative "rkseal/commands/create"
 require_relative "rkseal/commands/edit"
 require_relative "rkseal/commands/edit_local"
+require_relative "rkseal/commands/set"
 require_relative "rkseal/commands/reencrypt"
 require_relative "rkseal/commands/validate"
 require_relative "rkseal/commands/view"

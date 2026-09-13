@@ -72,6 +72,14 @@ module RKSeal
     # Maximum length of a DNS-1123 subdomain.
     DNS_NAME_MAX_LENGTH = 253
 
+    # Kubernetes Secret data key: alphanumerics, `-`, `_`, `.` (same rule as a
+    # ConfigMap key). The apiserver additionally refuses `.`, `..` and any key
+    # starting with `..` (they would escape the mount directory), checked in
+    # {.validate_data_key!}.
+    DATA_KEY_PATTERN = /\A[-._a-zA-Z0-9]+\z/
+    # Maximum length of a Secret data key.
+    DATA_KEY_MAX_LENGTH = 253
+
     # SealedSecret scope annotations -> rkseal scope symbol. Absence of both
     # means the default, strict scope.
     SCOPE_ANNOTATIONS = {
@@ -172,6 +180,27 @@ module RKSeal
         raise InvalidInputError,
               "#{field} #{value.inspect} is not a valid Kubernetes name " \
               "(lowercase letters, digits, '-' and '.', must start and end alphanumeric)"
+      end
+
+      # Validate a Secret data key supplied on the CLI (`rkseal set ... KEY`).
+      # The key only ever enters a YAML document (never argv or a path), so this
+      # is a fail-fast gate rather than a security boundary: an apiserver
+      # rejection would otherwise surface only on deploy.
+      #
+      # @param key [String] the data key to check.
+      # @return [String] the validated key (for chaining).
+      # @raise [RKSeal::InvalidInputError] if it is not a valid Secret data key.
+      def validate_data_key!(key)
+        raise InvalidInputError, "key must not be empty" if key.nil? || key.empty?
+        if key.length > DATA_KEY_MAX_LENGTH
+          raise InvalidInputError,
+                "key #{key.inspect} is too long (max #{DATA_KEY_MAX_LENGTH} characters)"
+        end
+        return key if DATA_KEY_PATTERN.match?(key) && key != "." && !key.start_with?("..")
+
+        raise InvalidInputError,
+              "key #{key.inspect} is not a valid Secret data key " \
+              "(letters, digits, '-', '_' and '.'; not '.' and not starting with '..')"
       end
 
       # Derive the sealing scope from a SealedSecret by inspecting its

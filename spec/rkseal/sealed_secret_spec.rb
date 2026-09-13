@@ -150,6 +150,63 @@ RSpec.describe RKSeal::SealedSecret do
     end
   end
 
+  describe ".strip_runtime" do
+    let(:cluster_json) do
+      JSON.generate(
+        "apiVersion" => "bitnami.com/v1alpha1", "kind" => "SealedSecret",
+        "metadata" => {
+          "name" => "db", "namespace" => "app",
+          "uid" => "abc", "resourceVersion" => "42", "creationTimestamp" => "2026-01-01T00:00:00Z",
+          "managedFields" => [{ "manager" => "kubectl" }],
+          "labels" => { "app" => "db" },
+          "annotations" => {
+            "sealedsecrets.bitnami.com/namespace-wide" => "true",
+            "kubectl.kubernetes.io/last-applied-configuration" => "{}"
+          }
+        },
+        "spec" => { "encryptedData" => { "password" => "AgAx" },
+                    "template" => { "type" => "Opaque" } },
+        "status" => { "observedGeneration" => 1 }
+      )
+    end
+
+    it "drops apiserver runtime metadata, the last-applied annotation, and status" do
+      doc = described_class.strip_runtime(cluster_json)
+      expect(doc["metadata"]).to eq(
+        "name" => "db", "namespace" => "app", "labels" => { "app" => "db" },
+        "annotations" => { "sealedsecrets.bitnami.com/namespace-wide" => "true" }
+      )
+      expect(doc).not_to have_key("status")
+    end
+
+    it "leaves the sealed payload untouched" do
+      doc = described_class.strip_runtime(cluster_json)
+      expect(doc["spec"]).to eq(JSON.parse(cluster_json)["spec"])
+    end
+
+    it "drops an annotations map left empty by the scrub" do
+      json = JSON.generate("kind" => "SealedSecret",
+                           "metadata" => { "name" => "db", "annotations" => {
+                             "kubectl.kubernetes.io/last-applied-configuration" => "{}"
+                           } })
+      expect(described_class.strip_runtime(json)["metadata"]).to eq("name" => "db")
+    end
+
+    it "accepts a pre-parsed Hash and returns a new document" do
+      original = JSON.parse(cluster_json)
+      doc = described_class.strip_runtime(original)
+      expect(doc).not_to have_key("status")
+      expect(original).to have_key("status")
+    end
+
+    it "rejects an empty or non-mapping document" do
+      expect { described_class.strip_runtime("") }
+        .to raise_error(RKSeal::InvalidInputError, /empty/)
+      expect { described_class.strip_runtime("- just\n- a list\n") }
+        .to raise_error(RKSeal::InvalidInputError, /mapping/)
+    end
+  end
+
   describe "#to_buffer" do
     subject(:buffer) { described_class.parse(sealed_yaml).to_buffer }
 
