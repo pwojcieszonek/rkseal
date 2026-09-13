@@ -27,13 +27,17 @@ module RKSeal
   #     live in `kube-system` and be named `bootstrap-token-<token-id>`, or the
   #     bootstrap authenticator ignores it.
   #
+  # The rules never exceed what the apiserver itself enforces on a stored
+  # Secret, so a Secret that exists on the cluster is always editable.
+  #
   # The same type object also seeds the `create` buffer with the keys the type
   # demands, so the operator fills in values instead of recalling key names.
   #
-  # Types outside the registry are accepted as custom (Kubernetes allows any
-  # type string) with no rules, except that an unknown name under a
-  # `kubernetes.io/` prefix is rejected: that prefix is reserved for built-in
-  # types, so an unknown one is a typo.
+  # Types outside the registry are custom types (Kubernetes allows any type
+  # string) with no rules. {.for} resolves any name; {.for_new} is the variant
+  # for a type the operator is choosing, and it rejects an unknown name under a
+  # `kubernetes.io/` prefix as a typo. That split matters: the apiserver stores
+  # such a type, so an existing Secret with one must still be editable.
   #
   # rubocop:disable Metrics/ClassLength -- the registry table and the two
   # rule-carrying subclasses live here on purpose, so the whole type contract
@@ -51,22 +55,37 @@ module RKSeal
     attr_reader :required_keys
     # @return [Array<String>] keys of which at least one must be non-empty.
     attr_reader :any_of_keys
-    # @return [Array<String>] keys the consumer understands but does not require.
-    attr_reader :optional_keys
     # @return [Array<String>] `metadata.annotations` that must be non-empty.
     attr_reader :required_annotations
     # @return [String] one-line guidance shown in the editor buffer header.
     attr_reader :hint
 
     class << self
-      # Resolve a type string to its {SecretType}.
+      # Resolve a manifest `type` to its {SecretType}. Total: any string maps
+      # to a registered type or a rule-free custom one.
       #
       # @param name [String] the manifest `type`.
-      # @return [RKSeal::SecretType] a registered type, or a rule-free custom one.
-      # @raise [RKSeal::InvalidInputError] for an unknown type under a reserved
-      #   Kubernetes prefix.
+      # @return [RKSeal::SecretType]
+      # @raise [RKSeal::InvalidInputError] for a blank or non-string name.
       def for(name)
-        known.fetch(name) { custom(name) }
+        name = normalize(name)
+        known.fetch(name) { new(name, hint: "custom type; no key rules are enforced") }
+      end
+
+      # Resolve a type the operator is choosing (`create --type`, or a type
+      # edited into a buffer). Same as {.for}, except that an unknown name under
+      # a reserved Kubernetes prefix is a typo and is rejected.
+      #
+      # @param name [String]
+      # @return [RKSeal::SecretType]
+      # @raise [RKSeal::InvalidInputError] for a blank name or a reserved-prefix typo.
+      def for_new(name)
+        type = self.for(name)
+        return type if known.key?(type.name) || !reserved?(type.name)
+
+        raise InvalidInputError,
+              "unknown Secret type #{type.name.inspect} under a reserved Kubernetes prefix " \
+              "(known: #{known.keys.join(", ")})"
       end
 
       # @return [Hash{String=>RKSeal::SecretType}] every built-in type by name.
@@ -76,12 +95,11 @@ module RKSeal
 
       private
 
-      def custom(name)
-        return new(name, hint: "custom type; no key rules are enforced") unless reserved?(name)
+      def normalize(name)
+        text = name.to_s.strip
+        raise InvalidInputError, "Secret type must not be empty" if text.empty?
 
-        raise InvalidInputError,
-              "unknown Secret type #{name.inspect} under a reserved Kubernetes prefix " \
-              "(known: #{known.keys.join(", ")})"
+        text
       end
 
       def reserved?(name)
@@ -92,31 +110,31 @@ module RKSeal
       # built-in type; splitting it would only scatter the registry.
       def registry
         [
-          new(OPAQUE, hint: "arbitrary keys and values"),
-          new("kubernetes.io/service-account-token",
-              required_annotations: %w[kubernetes.io/service-account.name],
-              optional_keys: %w[token ca.crt namespace], data_optional: true,
-              hint: "set the kubernetes.io/service-account.name annotation; " \
-                    "the token controller fills in token/ca.crt/namespace"),
+          SecretType.new(OPAQUE, hint: "arbitrary keys and values"),
+          SecretType.new("kubernetes.io/service-account-token",
+                         required_annotations: %w[kubernetes.io/service-account.name],
+                         data_optional: true,
+                         hint: "set the kubernetes.io/service-account.name annotation; " \
+                               "data may stay empty, the token controller fills in " \
+                               "token/ca.crt/namespace"),
           DockerConfig.new("kubernetes.io/dockercfg", required_keys: %w[.dockercfg],
                                                       hint: ".dockercfg must be a JSON object " \
                                                             "(legacy ~/.dockercfg format)"),
           DockerConfig.new("kubernetes.io/dockerconfigjson",
                            required_keys: %w[.dockerconfigjson],
-                           hint: ".dockerconfigjson must be a JSON object with an \"auths\" " \
-                                 "map (~/.docker/config.json format)"),
-          new("kubernetes.io/basic-auth", any_of_keys: %w[username password],
-                                          hint: "at least one of username/password must be set"),
-          new("kubernetes.io/ssh-auth", required_keys: %w[ssh-privatekey],
-                                        hint: "ssh-privatekey holds the private key (PEM)"),
-          new("kubernetes.io/tls", required_keys: %w[tls.crt tls.key],
-                                   optional_keys: %w[ca.crt],
-                                   hint: "tls.crt and tls.key hold the PEM certificate and key"),
+                           hint: ".dockerconfigjson must be a JSON object, normally with an " \
+                                 "\"auths\" map (~/.docker/config.json format)"),
+          SecretType.new("kubernetes.io/basic-auth", any_of_keys: %w[username password],
+                                                     hint: "at least one of username/password " \
+                                                           "must be set"),
+          SecretType.new("kubernetes.io/ssh-auth", required_keys: %w[ssh-privatekey],
+                                                   hint: "ssh-privatekey holds the private key " \
+                                                         "(PEM)"),
+          SecretType.new("kubernetes.io/tls", required_keys: %w[tls.crt tls.key],
+                                              hint: "tls.crt and tls.key hold the PEM " \
+                                                    "certificate and key (ca.crt is optional)"),
           BootstrapToken.new("bootstrap.kubernetes.io/token",
                              required_keys: %w[token-id token-secret],
-                             optional_keys: %w[description expiration
-                                               usage-bootstrap-authentication
-                                               usage-bootstrap-signing auth-extra-groups],
                              hint: "token-id is 6 and token-secret 16 chars of [a-z0-9]; the " \
                                    "Secret must be named bootstrap-token-<token-id> in kube-system")
         ]
@@ -128,15 +146,13 @@ module RKSeal
     # @param hint [String]
     # @param required_keys [Array<String>]
     # @param any_of_keys [Array<String>]
-    # @param optional_keys [Array<String>]
     # @param required_annotations [Array<String>]
     # @param data_optional [Boolean] whether an empty data map is legal.
-    def initialize(name, hint:, required_keys: [], any_of_keys: [], optional_keys: [],
+    def initialize(name, hint:, required_keys: [], any_of_keys: [],
                    required_annotations: [], data_optional: false)
       @name = name
       @required_keys = required_keys.freeze
       @any_of_keys = any_of_keys.freeze
-      @optional_keys = optional_keys.freeze
       @required_annotations = required_annotations.freeze
       @data_optional = data_optional
       @hint = hint
@@ -147,9 +163,13 @@ module RKSeal
       @data_optional
     end
 
-    # @return [Boolean] whether this is a registered built-in type.
-    def known?
-      self.class.known.key?(name)
+    # Whether the offline local edit can switch a SealedSecret to this type. The
+    # redacted buffer exposes neither annotations nor plaintext, so a type whose
+    # contract depends on them cannot be verified there.
+    #
+    # @return [Boolean]
+    def offline_switchable?
+      required_annotations.empty?
     end
 
     # The data skeleton for a new Secret of this type: every mandated key with
@@ -176,7 +196,7 @@ module RKSeal
     def validate!(secret)
       validate_keys!(secret.data.keys)
       validate_values!(secret.data)
-      validate_annotations!(secret.metadata["annotations"] || {})
+      validate_annotations!(secret.metadata["annotations"])
       validate_identity!(secret)
     end
 
@@ -209,6 +229,16 @@ module RKSeal
       validate_any_of_values!(data)
     end
 
+    # Enforce the rules that bind data to the Secret's name and namespace. A
+    # no-op for every built-in type except the bootstrap token. Accepts a
+    # partial Secret (the offline local edit passes only the resealed items),
+    # so a rule whose key is absent is skipped rather than failed.
+    #
+    # @param _secret [RKSeal::Secret]
+    # @return [void]
+    # @raise [RKSeal::InvalidInputError]
+    def validate_identity!(_secret); end
+
     private
 
     def validate_required_keys!(keys)
@@ -237,6 +267,11 @@ module RKSeal
     end
 
     def validate_annotations!(annotations)
+      annotations ||= {}
+      unless annotations.is_a?(Hash)
+        raise InvalidInputError, "metadata.annotations must be a mapping of annotation to value"
+      end
+
       missing = required_annotations.reject { |key| present?(annotations[key]) }
       return if missing.empty?
 
@@ -249,9 +284,6 @@ module RKSeal
     # value itself (it is secret material headed for stderr).
     def check_value!(_key, _plain); end
 
-    # Hook: rules that bind the data to the Secret's name/namespace.
-    def validate_identity!(_secret); end
-
     def decode(encoded)
       Base64.strict_decode64(encoded)
     end
@@ -261,24 +293,16 @@ module RKSeal
     end
 
     # `kubernetes.io/dockercfg` and `kubernetes.io/dockerconfigjson`: the
-    # apiserver rejects a value that does not parse as a JSON object, and the
-    # kubelet reads image-pull credentials from the `auths` map of the newer
-    # format.
+    # apiserver rejects a value that does not parse as a JSON object. It does not
+    # require an `auths` map (credential helpers are a legal config), so neither
+    # does rkseal.
     class DockerConfig < SecretType
       private
 
-      def check_value!(key, plain)
-        parsed = parse_json(key, plain)
-        return unless key == ".dockerconfigjson" && !parsed["auths"].is_a?(Hash)
-
-        raise InvalidInputError, "key #{key.inspect} must contain an \"auths\" JSON object"
-      end
-
       # JSON::ParserError#message quotes the offending input, which here is
       # secret material, so the parser's message is deliberately not surfaced.
-      def parse_json(key, plain)
-        parsed = JSON.parse(plain)
-        return parsed if parsed.is_a?(Hash)
+      def check_value!(key, plain)
+        return if JSON.parse(plain).is_a?(Hash)
 
         raise InvalidInputError, "key #{key.inspect} must be a JSON object"
       rescue JSON::ParserError
@@ -298,6 +322,23 @@ module RKSeal
         "token-secret" => /\A[a-z0-9]{16}\z/
       }.freeze
 
+      def validate_identity!(secret)
+        unless secret.namespace == NAMESPACE
+          raise InvalidInputError,
+                "a bootstrap token Secret must live in the #{NAMESPACE} namespace " \
+                "(got #{secret.namespace.inspect})"
+        end
+
+        token_id = secret.data["token-id"]
+        return if token_id.nil?
+
+        expected = "#{NAME_PREFIX}#{decode(token_id)}"
+        return if secret.name == expected
+
+        raise InvalidInputError,
+              "a bootstrap token Secret must be named #{expected} (got #{secret.name.inspect})"
+      end
+
       private
 
       def check_value!(key, plain)
@@ -306,20 +347,6 @@ module RKSeal
 
         raise InvalidInputError,
               "key #{key.inspect} must match #{pattern.inspect} (lowercase letters and digits)"
-      end
-
-      def validate_identity!(secret)
-        unless secret.namespace == NAMESPACE
-          raise InvalidInputError,
-                "a bootstrap token Secret must live in the #{NAMESPACE} namespace " \
-                "(got #{secret.namespace.inspect})"
-        end
-
-        expected = "#{NAME_PREFIX}#{decode(secret.data.fetch("token-id"))}"
-        return if secret.name == expected
-
-        raise InvalidInputError,
-              "a bootstrap token Secret must be named #{expected} (got #{secret.name.inspect})"
       end
     end
   end

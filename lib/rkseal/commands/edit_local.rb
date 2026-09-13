@@ -98,8 +98,7 @@ module RKSeal
         plan = build_plan(sealed, edit(sealed))
         return unchanged_result unless plan.changes?
 
-        validate_plan!(sealed, plan)
-        apply(plan, scope: sealed.scope)
+        write_plan!(sealed, plan)
 
         path = File.expand_path(manifest_path)
         deployed = @deploy && deploy_confirmed?
@@ -162,7 +161,7 @@ module RKSeal
         {
           string_data: string_map(doc["stringData"]),
           data: string_map(doc["data"]),
-          type: doc["type"] || Secret::DEFAULT_TYPE
+          type: buffer_type(doc)
         }
       rescue Psych::SyntaxError => e
         raise InvalidInputError, "the buffer is not valid YAML: #{e.message}"
@@ -178,6 +177,13 @@ module RKSeal
         raise InvalidInputError,
               "local edit cannot rename or move the secret " \
               "(expected #{@name}/#{@namespace}, got #{name.inspect}/#{namespace.inspect})"
+      end
+
+      # A YAML scalar other than a string (`type: 123`) is coerced, as
+      # {RKSeal::Secret.from_buffer} does, so the type resolver never sees a
+      # non-string.
+      def buffer_type(doc)
+        doc["type"] ? doc["type"].to_s : Secret::DEFAULT_TYPE
       end
 
       def string_map(raw)
@@ -224,16 +230,41 @@ module RKSeal
         end
       end
 
+      # Validate the plan against the type contract, then apply it to the file.
+      # The partial Secret (resealed items only) is built once: it holds the
+      # only plaintext this flow sees.
+      def write_plan!(sealed, plan)
+        partial = reseal_secret(plan)
+        validate_plan!(sealed, plan, partial)
+        apply(plan, partial, scope: sealed.scope)
+      end
+
       # Enforce the (possibly edited) type's contract on what the file will hold:
       # the presence rules over the final key set (kept ciphertext exposes only
-      # its keys) and the value rules over the items being resealed, which are
-      # the only plaintext this flow ever sees.
-      def validate_plan!(sealed, plan)
-        secret_type = SecretType.for(plan.type)
+      # its keys), and the value and identity rules over the resealed items,
+      # which are the only plaintext this flow ever sees. Switching to a type
+      # whose contract needs annotations is refused: the redacted buffer cannot
+      # carry them, so the rule could not be checked here.
+      def validate_plan!(sealed, plan, partial)
+        secret_type = resolve_type(plan)
         remaining = (sealed.encrypted_keys - plan.removed_keys) |
                     plan.reseal_string_data.keys | plan.reseal_data.keys
         secret_type.validate_keys!(remaining)
-        secret_type.validate_values!(reseal_secret(plan).data) if plan.reseal?
+        secret_type.validate_values!(partial.data)
+        secret_type.validate_identity!(partial)
+      end
+
+      # A type typed into the buffer is operator input (typo-checked); an
+      # unchanged type is whatever the file already holds and always resolves.
+      def resolve_type(plan)
+        return SecretType.for(plan.type) unless plan.type_changed
+
+        secret_type = SecretType.for_new(plan.type)
+        return secret_type if secret_type.offline_switchable?
+
+        raise InvalidInputError,
+              "local edit cannot switch to #{plan.type.inspect}: that type needs " \
+              "annotations the offline buffer cannot carry (use `rkseal create`)"
       end
 
       # Apply the plan to `<name>.yaml`: merge resealed items via kubeseal, then
@@ -241,19 +272,19 @@ module RKSeal
       # and re-emit YAML. The normalize pass is unconditional because
       # `kubeseal --merge-into` (v0.36.6) rewrites the file as JSON regardless of
       # the input format, so a `.yaml` would otherwise be left holding JSON.
-      def apply(plan, scope:)
+      def apply(plan, partial, scope:)
         path = manifest_path
         if plan.reseal?
           @kubeseal.ensure_cert!
-          @kubeseal.merge_into(reseal_secret(plan).to_manifest(scope: scope), file: path,
-                                                                              scope: scope)
+          @kubeseal.merge_into(partial.to_manifest(scope: scope), file: path, scope: scope)
         end
         normalize_file(path, plan)
       end
 
-      # Build the partial Secret carrying only the (re)sealed items. Round-tripped
-      # through {RKSeal::Secret.from_buffer} to reuse its base64 validation and
-      # stringData folding (stringData wins per key, exactly like a normal seal).
+      # Build the partial Secret carrying only the (re)sealed items (none for a
+      # plan without reseals). Round-tripped through {RKSeal::Secret.from_buffer}
+      # to reuse its base64 validation and stringData folding (stringData wins
+      # per key, exactly like a normal seal).
       def reseal_secret(plan)
         manifest = {
           "apiVersion" => Secret::API_VERSION,

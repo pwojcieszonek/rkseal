@@ -90,27 +90,28 @@ reproducible seals pins `--cert`/`SEALED_SECRETS_CERT` instead (strictly better 
 
 ### Secret types
 
-kubeseal seals any input; a Secret that violates its `type`'s contract is rejected only when
-the controller unseals it, and that failure is visible solely in controller events. rkseal
-enforces the contract client-side, before sealing (`RKSeal::SecretType`). Built-in types and
-what is enforced:
+`RKSeal::SecretType` enforces each built-in `type`'s contract client-side, before sealing,
+because kubeseal checks nothing and the apiserver rejects a broken Secret only after unsealing
+(visible solely in controller events). Invariants that no test will catch if broken:
 
-| Type | Contract |
-|---|---|
-| `Opaque` | at least one data item |
-| `kubernetes.io/service-account-token` | annotation `kubernetes.io/service-account.name` non-empty; `data` may be empty — sealed with `--allow-empty-data`, since kubeseal aborts on empty data otherwise |
-| `kubernetes.io/dockercfg` | `.dockercfg` is a JSON object |
-| `kubernetes.io/dockerconfigjson` | `.dockerconfigjson` is a JSON object with an `auths` map |
-| `kubernetes.io/basic-auth` | `username` and/or `password` present, at least one non-empty |
-| `kubernetes.io/ssh-auth` | `ssh-privatekey` non-empty |
-| `kubernetes.io/tls` | `tls.crt` and `tls.key` non-empty |
-| `bootstrap.kubernetes.io/token` | `token-id` `[a-z0-9]{6}`, `token-secret` `[a-z0-9]{16}`, namespace `kube-system`, name `bootstrap-token-<token-id>` |
-
-`create --type` seeds the required keys (empty values) and annotations into the buffer. Other
-type strings are custom types with no rules; an unknown name under `kubernetes.io/` or
-`bootstrap.kubernetes.io/` is rejected as a typo. `edit --local` runs the presence rules on the
-final key set and the value rules on the re-sealed keys only. Error messages never echo a
-value: `JSON::ParserError#message` quotes the input, so it is deliberately not surfaced.
+- **Rules must never exceed what the apiserver enforces on a stored Secret.** Anything
+  stricter (e.g. demanding an `auths` map in `.dockerconfigjson`) makes `edit` refuse a Secret
+  that legally exists on the cluster, and the operator has no override in `edit`.
+- **`SecretType.for` is total; `SecretType.for_new` is the typo gate.** The apiserver stores
+  any `type` string, including unknown `kubernetes.io/*` names, so resolving a type read from
+  the cluster or a file must never raise. Only operator-chosen types (`--type`, a type edited
+  into a buffer) go through `for_new`, which rejects unknown reserved-prefix names.
+- **A seeded placeholder left empty is dropped, not sealed** (`Secret#without_empty` in
+  `create`), so a missing required key is reported as missing and an unfilled optional key
+  (basic-auth `password`) never becomes an empty item on the cluster.
+- **`edit --local` cannot verify annotation contracts** (the redacted buffer carries none), so
+  it refuses to switch a file to a type with `required_annotations`. It does run the value and
+  identity rules on the resealed items.
+- **Error messages never echo a value.** `JSON::ParserError#message` quotes the input, so it
+  is deliberately not surfaced.
+- kubeseal aborts on empty `data` unless `--allow-empty-data`; `Kubeseal#seal` takes
+  `allow_empty_data:` and the flows pass `secret.empty?`, which `validate!` has already
+  restricted to data-optional types (service-account-token).
 
 ### Key rotation
 

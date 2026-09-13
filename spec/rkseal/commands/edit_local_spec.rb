@@ -254,6 +254,60 @@ RSpec.describe RKSeal::Commands::EditLocal do
         end
       end
 
+      context "when the type is switched to one whose contract needs annotations" do
+        let(:edited_buffer) do
+          <<~YAML
+            apiVersion: v1
+            kind: Secret
+            metadata: { name: db, namespace: app }
+            type: kubernetes.io/service-account-token
+            stringData: {}
+          YAML
+        end
+
+        it "refuses: the redacted buffer cannot carry the annotation" do
+          expect { command.call }
+            .to raise_error(RKSeal::InvalidInputError, /cannot switch to .*service-account-token/)
+          expect(File.read(written_path)).to eq(local_sealed)
+        end
+      end
+
+      context "when the type is edited to a non-string scalar" do
+        let(:edited_buffer) do
+          "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
+            "type: 123\nstringData: { password: <redacted>, username: <redacted> }\n"
+        end
+
+        it "fails with InvalidInputError (typo check on a reserved prefix does not crash)" do
+          expect { command.call }.not_to raise_error(NoMethodError)
+          expect(YAML.safe_load_file(written_path).dig("spec", "template", "type")).to eq("123")
+        end
+      end
+
+      context "when a bootstrap token-id is resealed to a value the file name does not embed" do
+        let(:local_sealed) do
+          <<~YAML
+            apiVersion: bitnami.com/v1alpha1
+            kind: SealedSecret
+            metadata: { name: db, namespace: app }
+            spec:
+              encryptedData: { token-id: AgAid, token-secret: AgAsecret }
+              template: { type: bootstrap.kubernetes.io/token }
+          YAML
+        end
+        let(:edited_buffer) do
+          "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
+            "type: bootstrap.kubernetes.io/token\n" \
+            "stringData: { token-id: ghijkl, token-secret: <redacted> }\n"
+        end
+
+        it "refuses via the identity rule instead of writing an unusable token" do
+          expect { command.call }
+            .to raise_error(RKSeal::InvalidInputError, /must live in the kube-system namespace/)
+          expect(kubeseal).not_to have_received(:merge_into)
+        end
+      end
+
       context "when a resealed value breaks the type's value rule" do
         let(:local_sealed) do
           <<~YAML

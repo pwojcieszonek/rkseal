@@ -201,12 +201,13 @@ RSpec.describe RKSeal::Commands::Create do
           .with(hash_including(content: a_string_matching(/tls\.crt: ''\n\s+tls\.key: ''/)))
       end
 
-      it "rejects a required key left at its empty seed value" do
+      it "reports a required key left at its empty seed value as missing" do
         allow(editor).to receive(:edit).and_return(
           "apiVersion: v1\nkind: Secret\nmetadata: { name: db, namespace: app }\n" \
           "type: kubernetes.io/tls\nstringData: { tls.crt: cert, tls.key: '' }\n"
         )
-        expect { command.call }.to raise_error(RKSeal::InvalidInputError, /"tls\.key" is empty/)
+        expect { command.call }
+          .to raise_error(RKSeal::InvalidInputError, /requires tls\.key \(present: tls\.crt\)/)
       end
 
       it "seals when --from-file supplies both keys with --no-edit" do
@@ -223,6 +224,23 @@ RSpec.describe RKSeal::Commands::Create do
         expect(kubeseal).to have_received(:seal)
           .with(a_string_including("tls.crt: #{b64("CERT")}"),
                 scope: :strict, allow_empty_data: false)
+      end
+    end
+
+    context "with a basic-auth Secret seeded from --from-file" do
+      let(:type) { "kubernetes.io/basic-auth" }
+
+      it "does not seal the seeded password placeholder the operator never filled" do
+        src = File.join(output_dir, "u")
+        File.write(src, "bob")
+        typed = described_class.new(
+          namespace: "app", name: "db", type: type, no_edit: true, from_file: { "username" => src },
+          kubeseal: kubeseal, editor: editor, workspace: workspace, output_dir: output_dir
+        )
+        typed.call
+        expect(kubeseal).to have_received(:seal) do |manifest, **|
+          expect(YAML.safe_load(manifest).fetch("data")).to eq("username" => b64("bob"))
+        end
       end
     end
 
